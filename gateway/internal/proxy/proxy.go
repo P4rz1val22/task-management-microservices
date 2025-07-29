@@ -47,8 +47,10 @@ func SmartProxy() gin.HandlerFunc {
 			return
 		}
 
-		// Route everything else to Monolith
-		ForwardToMonolith(c)
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":            "Endpoint not found in microservices architecture",
+			"available_routes": []string{"/auth/*", "/projects/*", "/tasks/*", "/gateway/health"},
+		})
 	}
 }
 
