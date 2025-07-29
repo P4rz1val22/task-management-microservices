@@ -108,7 +108,6 @@ func ForwardToTaskService(c *gin.Context) {
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
-// ForwardToProjectService forwards project requests to the project service
 func ForwardToProjectService(c *gin.Context) {
 	target, err := url.Parse(PROJECT_SERVICE_URL)
 	if err != nil {
@@ -164,27 +163,12 @@ func ForwardToMonolith(c *gin.Context) {
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
-// HealthCheck provides gateway health status
 func HealthCheck(c *gin.Context) {
-	// Test connection to all services
-	monolithResp, monolithErr := http.Get(MONOLITH_BASE_URL + "/health")
 	authResp, authErr := http.Get(AUTH_SERVICE_URL + "/health")
 	projectResp, projectErr := http.Get(PROJECT_SERVICE_URL + "/health")
 	taskResp, taskErr := http.Get(TASK_SERVICE_URL + "/health")
 
-	var monolithStatus, authStatus, projectStatus, taskStatus string
-
-	// Check monolith status
-	if monolithErr != nil {
-		monolithStatus = "unreachable"
-	} else {
-		monolithResp.Body.Close()
-		if monolithResp.StatusCode == 200 {
-			monolithStatus = "healthy"
-		} else {
-			monolithStatus = "unhealthy"
-		}
-	}
+	var authStatus, projectStatus, taskStatus string
 
 	// Check auth service status
 	if authErr != nil {
@@ -224,23 +208,20 @@ func HealthCheck(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"gateway_status":         "healthy",
-		"monolith_status":        monolithStatus,
 		"auth_service_status":    authStatus,
 		"project_service_status": projectStatus,
 		"task_service_status":    taskStatus,
 		"gateway_port":           "8081",
 		"services": gin.H{
-			"monolith":        MONOLITH_BASE_URL,
 			"auth_service":    AUTH_SERVICE_URL,
 			"project_service": PROJECT_SERVICE_URL,
 			"task_service":    TASK_SERVICE_URL,
 		},
-		"message": "API Gateway with full microservices routing",
+		"message": "Pure microservices API Gateway",
 		"routing": gin.H{
-			"/auth/*":         "auth-service (port 8082)",
-			"/projects/*":     "project-service (port 8083)",
-			"/tasks/*":        "task-service (port 8084)",
-			"everything_else": "monolith (port 8080)",
+			"/auth/*":     "auth-service",
+			"/projects/*": "project-service",
+			"/tasks/*":    "task-service",
 		},
 	})
 }
