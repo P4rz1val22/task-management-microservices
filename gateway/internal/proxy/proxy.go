@@ -5,19 +5,26 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	MONOLITH_BASE_URL   = "http://localhost:8080"
-	AUTH_SERVICE_URL    = "http://localhost:8082"
-	PROJECT_SERVICE_URL = "http://localhost:8083"
-	TASK_SERVICE_URL    = "http://localhost:8084"
+var (
+	MONOLITH_BASE_URL   = getEnv("MONOLITH_URL", "http://localhost:8080")
+	AUTH_SERVICE_URL    = getEnv("AUTH_SERVICE_URL", "http://localhost:8082")
+	PROJECT_SERVICE_URL = getEnv("PROJECT_SERVICE_URL", "http://localhost:8083")
+	TASK_SERVICE_URL    = getEnv("TASK_SERVICE_URL", "http://localhost:8084")
 )
 
-// SmartProxy routes requests to appropriate services
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 func SmartProxy() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
