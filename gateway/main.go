@@ -32,7 +32,9 @@ func main() {
 	r.GET("/gateway/health", proxy.HealthCheck)
 
 	// Forward requests with smart routing
-	r.NoRoute(proxy.SmartProxy())
+	r.Any("/auth/*path", proxy.SmartProxy())
+	r.Any("/projects/*path", proxy.SmartProxy())
+	r.Any("/tasks/*path", proxy.SmartProxy())
 
 	log.Println("🚀 API Gateway starting on port 8081")
 	log.Println("📡 Forwarding all requests to monolith at http://localhost:8080")
