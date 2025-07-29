@@ -30,11 +30,6 @@ import (
 	"github.com/P4rz1val22/task-management-api/internal/handlers"
 	"github.com/P4rz1val22/task-management-api/internal/middleware"
 	"github.com/gin-gonic/gin"
-
-	// Swagger imports
-	_ "github.com/P4rz1val22/task-management-api/docs"
-	"github.com/swaggo/files"
-	ginSwagger "github.com/swaggo/gin-swagger"
 )
 
 func main() {
@@ -42,7 +37,7 @@ func main() {
 
 	r := gin.Default()
 
-	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	//r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	// Health Check
 	r.GET("/health", func(c *gin.Context) {
