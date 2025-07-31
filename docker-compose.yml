@@ -1,0 +1,129 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: task-mgmt-postgres
+    environment:
+      POSTGRES_DB: taskmanagement
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - microservices
+
+  # Monolith Service
+  monolith:
+    build:
+      context: ./monolith
+      dockerfile: Dockerfile
+    container_name: task-mgmt-monolith
+    environment:
+      - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
+      - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+      - GIN_MODE=release
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - microservices
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: task-mgmt-auth
+    environment:
+      - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
+      - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+      - GIN_MODE=release
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - microservices
+
+  # Project Service
+  project-service:
+    build:
+      context: ./project-service
+      dockerfile: Dockerfile
+    container_name: task-mgmt-projects
+    environment:
+      - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
+      - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+      - GIN_MODE=release
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - microservices
+
+  # Task Service
+  task-service:
+    build:
+      context: ./task-service
+      dockerfile: Dockerfile
+    container_name: task-mgmt-tasks
+    environment:
+      - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
+      - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+      - GIN_MODE=release
+    ports:
+      - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - microservices
+
+  # API Gateway
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: task-mgmt-gateway
+    environment:
+      - MONOLITH_URL=http://monolith:8080
+      - AUTH_SERVICE_URL=http://auth-service:8082
+      - PROJECT_SERVICE_URL=http://project-service:8083
+      - TASK_SERVICE_URL=http://task-service:8084
+      - GIN_MODE=release
+    ports:
+      - "8081:8081"
+    depends_on:
+      - monolith
+      - auth-service
+      - project-service
+      - task-service
+    restart: unless-stopped
+    networks:
+      - microservices
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  microservices:
+    driver: bridge
