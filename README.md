@@ -6,46 +6,6 @@
 
 This project demonstrates the evolution from a monolithic API to a microservices architecture, showcasing industry-standard patterns for service decomposition and API gateway routing.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Client Applications                     │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  API Gateway                                │
-│                (Port 8081)                                 │
-│                                                             │
-│  Smart Routing:                                             │
-│  • /auth/*     → Auth Service (8082)                      │
-│  • /projects/* → Project Service (8083)                   │
-│  • /tasks/*    → Task Service (8084)                      │
-│  • /users/*    → Monolith (8080)                         │
-└─────────────┬─────────────┬─────────────┬─────────────────┘
-              │             │             │
-              ▼             ▼             ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  Auth Service   │ │ Project Service │ │   Task Service  │
-│   (Port 8082)   │ │   (Port 8083)   │ │   (Port 8084)   │
-└─────────────────┘ └─────────────────┘ └─────────────────┘
-              │             │             │
-              └─────────────┼─────────────┘
-                            ▼
-                  ┌─────────────────┐
-                  │   Monolith      │
-                  │  (Port 8080)    │
-                  │                 │
-                  │ • User Profile  │
-                  │ • Legacy APIs   │
-                  └─────────────────┘
-                            │
-                            ▼
-                  ┌─────────────────┐
-                  │   PostgreSQL    │
-                  │  (Shared DB)    │
-                  └─────────────────┘
-```
-
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -53,12 +13,8 @@ This project demonstrates the evolution from a monolithic API to a microservices
 - PostgreSQL (Neon/local)
 - Environment variables configured
 
-### Run All Services
+### Run All Services Locally
 ```bash
-# Start all services with Docker Compose
-docker-compose up -d
-
-# OR manually start each service:
 # Terminal 1: Gateway
 cd gateway && go run main.go
 
@@ -112,6 +68,12 @@ task-management-microservices/
     ├── internal/              # Monolith business logic
     └── docs/                  # Swagger documentation
 ```
+
+## 🐳 Docker Architecture
+
+### Container Overview
+This project uses **multi-stage Docker builds** for optimized, production-ready containers
+
 
 ## 🔧 Services Overview
 
@@ -202,14 +164,9 @@ GET /tasks?project_id=1&status=In Progress&priority=High&due_date_from=2025-01-0
 - User ID and email in token claims
 - Bearer token validation middleware
 
-## 📊 Data Strategy
+## 📊 Database
 
-### Shared Database Approach
-- **Single PostgreSQL instance** serves all services
-- **Gradual migration** without data duplication
-- **Consistent relationships** across service boundaries
-
-**Database Tables**:
+**Tables**:
 - `users` - User accounts and authentication
 - `projects` - Project information and ownership
 - `tasks` - Task details with project/user relationships
@@ -251,26 +208,13 @@ curl -H "Authorization: Bearer <JWT_TOKEN>" \
   "http://localhost:8081/tasks?status=In Progress&priority=High"
 ```
 
-## 🚀 Deployment
 
-### Local Development
-```bash
-# Start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop all services
-docker-compose down
+### Environment Variables
+Required for all services:
 ```
-
-### Production Deployment
-See `/docs/deployment-guide.md` for:
-- Containerization with Docker
-- Kubernetes deployment manifests
-- CI/CD pipeline configuration
-- Monitoring and observability setup
+DATABASE_URL=<your-postgresql-connection-string>
+JWT_SECRET=<your-secret-key>
+```
 
 ## 📈 Performance Considerations
 
@@ -284,18 +228,6 @@ See `/docs/deployment-guide.md` for:
 - **Resource isolation**: Memory/CPU per service
 - **Deployment isolation**: Update services independently
 
-## 🔄 Migration Strategy (Strangler Fig Pattern)
-
-### Phase 1: Foundation ✅ COMPLETE
-- [x] API Gateway with intelligent routing
-- [x] Auth Service extraction
-- [x] Project Service extraction
-- [x] Task Service extraction
-- [x] Shared database strategy
-
-### Phase 2: Advanced Services (Future)
-- [ ] Notification Service for emails
-- [ ] User Profile Service
 
 ## 🛠️ Technology Stack
 
@@ -313,23 +245,6 @@ See `/docs/deployment-guide.md` for:
 **Testing & Documentation**:
 - Postman automated tests
 - Swagger API documentation
-- Comprehensive logging
-
-## 📚 Learning Outcomes
-
-### Microservices Patterns Demonstrated
-1. **API Gateway Pattern** - Single entry point with intelligent routing
-2. **Strangler Fig Pattern** - Gradual migration from monolith
-3. **Shared Database** - Pragmatic approach to service extraction
-4. **Service Authentication** - JWT token validation across services
-5. **Health Check Aggregation** - Centralized service monitoring
-
-### Industry Best Practices Applied
-- **Zero-downtime migration** approach
-- **API compatibility** preservation
-- **Independent deployability** of services
-- **Separation of concerns** by business domain
-- **Comprehensive testing** strategy
 
 ## 🤝 Contributing
 
@@ -355,18 +270,11 @@ See `/docs/deployment-guide.md` for:
 - **Architecture Decisions**: `/docs/architecture-decisions.md`
 - **Postman Collection**: `/docs/postman-collection.json`
 
-## 🏆 Project Achievements
-
-This project successfully demonstrates:
-- ✅ **Service isolation** by business domain
-- ✅ **Independent deployability** of components
-- ✅ **Maintained API compatibility** for existing clients
-- ✅ **Scalable architecture** foundation for future growth
-- ✅ **Industry-standard patterns** and best practices
-- ✅ **Comprehensive testing** and monitoring capabilities
 
 ---
 
 **Built as part of an 8-week intensive coding journey - Week 4: Microservices Architecture**
 
-*Showcasing the evolution from monolithic systems to distributed microservices using production-ready patterns and industry best practices.*
+*A complete evolution from monolithic systems to containerized microservices, showcasing production-ready patterns, Docker orchestration, and enterprise-level architectural thinking. Ready for deployment on any cloud platform.*
+
+**🐳 Docker + 🏗️ Microservices + 🚀 Production Ready**
