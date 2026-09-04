@@ -1191,3 +1191,110 @@ up to one poll interval of notification latency, which for email is invisible.
 | notification-service | Emailed both — the two notifications that were previously lost forever |
 
 Consumer lag returned to zero on all three partitions with no intervention.
+
+---
+
+## Stage 9 — handoff notes (start a new session here)
+
+### State
+
+Stages 0–8b are complete and committed. `HEAD` is `f34b53a`
+(`chore: commit the Postman collection export as-is`) on `feat/kafka-event-system`,
+working tree clean. Nothing has been pushed: `origin` has only `main` at `157beff`,
+which is this branch's fork point.
+
+Two things to know before starting:
+
+- **`backup/pre-trailer-strip`** holds the pre-rewrite history. The branch was
+  rewritten to strip `Co-Authored-By: Claude` from all 18 commits (re-signed; trees
+  verified byte-identical). Delete it when satisfied:
+  `git branch -D backup/pre-trailer-strip`.
+- **Do not add Claude co-author trailers to commits in this repo.**
+
+### Scope decision already taken
+
+The original Stage 9 wanted new tests added to the Postman collection. That was
+narrowed after counting what exists: **171 Go unit tests plus 45 integration
+assertions**, but covering only `task-service` and `notification-service`, every one
+against a mock database. `gateway`, `auth-service`, `project-service` and `monolith`
+have **zero** Go tests.
+
+So: **rescue the collection, do not invest in it.** Get it into git (done), make it
+stop lying, stop there. The end-to-end coverage the gateway lacks is better written
+as a Go integration test behind the existing `-tags=integration`, where it sits beside
+everything else instead of splitting one guarantee across two toolchains.
+
+### 1. Make the collection idempotent
+
+All three faults verified in the committed export. A re-run against a non-fresh
+database currently produces three false failures plus a cascade.
+
+| Request | Fault | Fix |
+|---|---|---|
+| `Authentication (via Gateway) :: Register User` | Hardcoded `"email": "microservices@test.com"` → 409 on any second run | Randomise, e.g. `{{$randomEmail}}` or a pre-request script setting a collection variable |
+| `Projects (via Gateway) :: Create Project` | Hardcoded `"name": "Microservices Test Project"` → 409, leaves `project_id` empty, cascades into ~5 downstream failures | Randomise the name |
+| `Projects (via Gateway) :: Update Project` | Hardcoded `"name": "Updated Microservices Project"` | Randomise the name |
+| `Tasks … :: Filter Tasks by Status` | Queries `?status=Done` but asserts `pm.expect(task.status).to.eql('In Progress')` — the test contradicts its own query; the endpoint is fine | Assert `'Done'`; also drop or fix the unrelated `priority === 'High'` assertion sitting beside it |
+
+Reuse the collection variables that already exist rather than adding new ones:
+`gateway_url`, `auth_token`, `project_id`, `task_id`.
+
+Verify headlessly, twice in a row, without resetting the database — passing on the
+second run is the whole point:
+
+```bash
+npx newman run "docs/postman/Task Management Microservices API.postman_collection.json"
+```
+
+### 2. Optional: tests for the three health requests
+
+These have no test script at all, which is where "17 requests, 15 tests" comes from:
+`Direct Auth Service Health`, `Direct Project Service Health`,
+`Direct Task Service Health`.
+
+Mind the trap in CLAUDE.md: the gateway does **not** serve `/health`. A request to
+`localhost:8081/health` falls through to the monolith and returns a healthy-looking
+200 that says nothing about the gateway. Assert on the four `*_status` fields of
+`/gateway/health`.
+
+### 3. Go integration test for the gateway path
+
+New file behind `//go:build integration`, driving `localhost:8081` with the stack up:
+register → login → create project → create task → read it back. Genuinely new
+coverage — no Go test currently touches the gateway, the JWT middleware, or a
+cross-service flow.
+
+Then the outbox guarantee end to end, which is a stronger claim than the one the
+original plan described: stop Kafka, create a task, assert **201**, assert an `outbox`
+row exists with `sent_at` NULL, start Kafka, assert the row drains and `sent_at`
+fills in. Before Stage 8b that scenario lost the event; now it is recoverable, and the
+test should say so.
+
+### 4. README
+
+Update the architecture section and diagram for the broker, the dead-letter topic and
+the consumer. Add a "Running the tests" section documenting the two-tier split —
+plain `go test ./...` needs no Docker, `-tags=integration` needs the stack up —
+because an undocumented build tag is an invisible test suite. Six modules now, eight
+containers.
+
+### Final counts for the Knowledge Bank
+
+- 6 Go modules, 8 containers, 3 event types, 2 Kafka topics (`task-events`,
+  `task-events.dlq`)
+- 171 Go unit tests, no Docker required, plus 45 integration assertions
+- Tables owned by this work: `outbox` (task-service), `processed_events`
+  (notification-service)
+
+### Environment notes
+
+`~/Downloads` is not readable by default on this machine (macOS privacy protection),
+so collection exports have to be copied into the repo by hand, or fetched through the
+Postman API with a key. Fetching via the API is worth doing at some point: a habit
+that depends on remembering File → Export is a habit that stops after twice.
+
+One session hit a state where every `git` invocation returned `fatal: Unable to read
+current working directory: Operation not permitted` while plain `ls` still worked. It
+began immediately after a Bash call made with the sandbox disabled and cleared on its
+own. If it recurs, avoid disabling the sandbox and have the user run git with the `!`
+prefix.
