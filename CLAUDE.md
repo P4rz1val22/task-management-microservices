@@ -142,6 +142,25 @@ service on the host from inside its own directory.
 and `~/Documents/Github/Code/task-management-microservices` are the same repo.
 Docker reports paths via the symlink. There is no second copy.
 
+## Subagents
+
+Default to direct tool calls. Spawn a subagent only when one of these is true:
+
+- The search is genuinely broad — you cannot name the files in advance, and
+  answering will mean reading more than roughly ten of them.
+- It is a factual question about something outside this repo (a library's
+  current API, Claude Code's own behaviour) where answering from memory risks
+  a confident wrong answer.
+
+Do not spawn one to read a handful of known files, to re-verify something
+already established in the conversation, or to run a command you could run
+yourself. An Explore agent once cost 38k tokens and 2.5 minutes here to read
+four files that three targeted reads would have covered.
+
+When you do spawn one, state in a single line what you are delegating and why,
+before the call. Token usage is never reported back to the main session, so
+that line is the only cost signal the user gets.
+
 ## Current work
 
 `docs/EVENT_SYSTEM_PLAN.md` is the active plan: finishing the migration with a
