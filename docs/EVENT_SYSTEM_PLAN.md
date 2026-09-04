@@ -525,10 +525,30 @@ a fake that appends to a slice and can be told to return an error. Assert:
 cd task-service && go get github.com/segmentio/kafka-go && go mod tidy
 ```
 
-- [ ] Test written first and observed failing
-- [ ] Key-is-task-ID assertion present and passing
-- [ ] Writer errors propagate rather than being logged
-- [ ] Commit: `feat: kafka publisher with fake-writer tests`
+- [x] Test written first and observed failing to compile on `undefined: Publisher`
+- [x] Key-is-task-ID assertion present and passing
+- [x] Writer errors propagate rather than being logged
+- [x] Commit: `feat: kafka publisher with fake-writer tests`
+
+Two things the stage turned up that the plan had not called for:
+
+- **The balancer needed its own assertion.** kafka-go's zero-value `Balancer` is
+  round-robin, which ignores the key entirely. `TestMessageKeyIsTaskID` passes
+  perfectly well while every event scatters across the three partitions, so the
+  key assertion alone does not protect the ordering guarantee —
+  `TestWriterUsesHashBalancer` is what actually does. Verified by mutation:
+  swapping in `&kafka.RoundRobin{}` leaves the key test green and fails only
+  that one.
+- **`Async` must stay false.** An async writer returns `nil` from
+  `WriteMessages` immediately and reports failures to a callback, which would
+  make "writer errors propagate" true against the fake and false in production.
+  `TestWriterIsSynchronous` pins it.
+
+Compose still passes no `KAFKA_BROKERS`/`KAFKA_TOPIC` to `task-service`; adding
+them belongs with the wiring in Stage 4. Until then the constructor falls back to
+`localhost:9092` / `task-events`, which is right for running the service on the
+host and wrong inside the network — nothing calls `NewPublisher` yet, so nothing
+depends on it.
 
 ---
 
