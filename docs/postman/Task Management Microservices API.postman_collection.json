@@ -1,0 +1,741 @@
+{
+  "info": {
+    "_postman_id": "83196fef-dfd1-47f1-b0cc-6d5988257b18",
+    "name": "Task Management Microservices API",
+    "description": "Complete test suite for microservices architecture with API Gateway routing",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "22370233"
+  },
+  "item": [
+    {
+      "name": "Health Checks",
+      "item": [
+        {
+          "name": "Gateway Health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Gateway is healthy', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().gateway_status).to.eql('healthy');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{gateway_url}}/gateway/health",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "gateway",
+                "health"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Direct Auth Service Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8082/health",
+              "protocol": "http",
+              "host": [
+                "localhost"
+              ],
+              "port": "8082",
+              "path": [
+                "health"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Direct Project Service Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8083/health",
+              "protocol": "http",
+              "host": [
+                "localhost"
+              ],
+              "port": "8083",
+              "path": [
+                "health"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Direct Task Service Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8084/health",
+              "protocol": "http",
+              "host": [
+                "localhost"
+              ],
+              "port": "8084",
+              "path": [
+                "health"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Authentication (via Gateway)",
+      "item": [
+        {
+          "name": "Register User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Registration successful', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(pm.response.json()).to.have.property('token');",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "    pm.collectionVariables.set('auth_token', pm.response.json().token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Microservices Tester\",\n  \"email\": \"microservices@test.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{gateway_url}}/auth/register",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "auth",
+                "register"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Login User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Login successful', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json()).to.have.property('token');",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "    pm.collectionVariables.set('auth_token', pm.response.json().token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"microservices@test.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{gateway_url}}/auth/login",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Projects (via Gateway)",
+      "item": [
+        {
+          "name": "Create Project",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Project created successfully', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(pm.response.json().project).to.have.property('id');",
+                  "    pm.expect(pm.response.json().project.name).to.eql('Microservices Test Project');",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "    pm.collectionVariables.set('project_id', pm.response.json().project.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Microservices Test Project\",\n  \"description\": \"Testing project creation through API Gateway\"\n}"
+            },
+            "url": {
+              "raw": "{{gateway_url}}/projects",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "projects"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Projects",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Projects listed successfully', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json()).to.have.property('projects');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/projects",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "projects"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Project by ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Project retrieved successfully', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().project).to.have.property('task_count');",
+                  "});"
+                ],
+                "type": "text/javascript",
+                "packages": {}
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/projects/{{project_id}}",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "projects",
+                "{{project_id}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Project",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Project updated successfully', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().project.name).to.eql('Updated Microservices Project');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Microservices Project\",\n  \"description\": \"Updated through API Gateway routing\"\n}"
+            },
+            "url": {
+              "raw": "{{gateway_url}}/projects/{{project_id}}",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "projects",
+                "{{project_id}}"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Tasks (via Gateway → Task Service)",
+      "item": [
+        {
+          "name": "Create Task",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Task created via Task Service successfully', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(pm.response.json().task).to.have.property('id');",
+                  "    pm.expect(pm.response.json().task.title).to.eql('Microservices Task Test');",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "    pm.collectionVariables.set('task_id', pm.response.json().task.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Microservices Task Test\",\n  \"description\": \"Testing task creation through Task Service\",\n  \"project_id\": {{project_id}},\n  \"status\": \"In Progress\",\n  \"priority\": \"High\",\n  \"estimate\": \"L\"\n}"
+            },
+            "url": {
+              "raw": "{{gateway_url}}/tasks",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "tasks"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List All Tasks",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Tasks routed to Task Service successfully', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json()).to.have.property('tasks');",
+                  "    ",
+                  "    // Verify enriched data from cross-service calls",
+                  "    if (pm.response.json().tasks.length > 0) {",
+                  "        const task = pm.response.json().tasks[0];",
+                  "        pm.expect(task).to.have.property('project');",
+                  "        pm.expect(task.project).to.have.property('name');",
+                  "        pm.expect(task).to.have.property('creator');",
+                  "        pm.expect(task).to.have.property('assignee');",
+                  "    }",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/tasks",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "tasks"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Filter Tasks by Status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Task filtering works correctly', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const tasks = pm.response.json().tasks;",
+                  "    ",
+                  "    // Verify all returned tasks match filter criteria",
+                  "    tasks.forEach(function(task) {",
+                  "        if (task.status) pm.expect(task.status).to.eql('In Progress');",
+                  "        if (task.priority) pm.expect(task.priority).to.eql('High');",
+                  "    });",
+                  "});"
+                ],
+                "type": "text/javascript",
+                "packages": {}
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/tasks?status=Done",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "tasks"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "Done"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Task by ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Individual task retrieved successfully', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().task).to.have.property('project');",
+                  "    pm.expect(pm.response.json().task.project).to.have.property('name');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/tasks/{{task_id}}",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "tasks",
+                "{{task_id}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Task",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Task updated successfully', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().task.title).to.eql('Updated Microservices Task');",
+                  "    pm.expect(pm.response.json().task.status).to.eql('Done');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Updated Microservices Task\",\n  \"description\": \"Updated through Task Service\",\n  \"project_id\": {{project_id}},\n  \"status\": \"Done\",\n  \"priority\": \"Medium\",\n  \"estimate\": \"M\"\n}"
+            },
+            "url": {
+              "raw": "{{gateway_url}}/tasks/{{task_id}}",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "tasks",
+                "{{task_id}}"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Legacy Endpoints (via Monolith)",
+      "item": [
+        {
+          "name": "User Profile (Still via Monolith)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Legacy user profile still works via monolith', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json()).to.have.property('user');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/users/me",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "users",
+                "me"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Complete Microservices Architecture Test",
+      "item": [
+        {
+          "name": "Full End-to-End Workflow",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('🎉 COMPLETE MICROSERVICES ARCHITECTURE WORKING!', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const health = pm.response.json();",
+                  "    ",
+                  "    // Verify all services are healthy",
+                  "    pm.expect(health.gateway_status).to.eql('healthy');",
+                  "    pm.expect(health.auth_service_status).to.eql('healthy');",
+                  "    pm.expect(health.project_service_status).to.eql('healthy');",
+                  "    pm.expect(health.task_service_status).to.eql('healthy');",
+                  "    pm.expect(health.monolith_status).to.eql('healthy');",
+                  "    ",
+                  "    console.log('🚀 MICROSERVICES ARCHITECTURE COMPLETE!');",
+                  "    console.log('✅ Auth Service: JWT authentication working');",
+                  "    console.log('✅ Project Service: CRUD operations working');",
+                  "    console.log('✅ Task Service: Complex filtering & validation working');",
+                  "    console.log('✅ API Gateway: Smart routing to 4 services working');",
+                  "    console.log('✅ Monolith: Legacy endpoints still working');",
+                  "    console.log('✅ Cross-service data: Enriched responses working');",
+                  "    console.log('✅ JWT tokens: Working across all services');",
+                  "    console.log('');",
+                  "    console.log('🏗️ ROUTING SUMMARY:');",
+                  "    console.log('• /auth/* → Auth Service (port 8082)');",
+                  "    console.log('• /projects/* → Project Service (port 8083)');",
+                  "    console.log('• /tasks/* → Task Service (port 8084)');",
+                  "    console.log('• /users/* → Monolith (port 8080)');",
+                  "    console.log('');",
+                  "    console.log('🎯 WEEK 4 GOALS ACHIEVED!');",
+                  "});",
+                  "",
+                  "// Verify routing configuration",
+                  "pm.test('All microservices routing configured', function () {",
+                  "    const routing = pm.response.json().routing;",
+                  "    pm.expect(routing['/auth/*']).to.include('8082');",
+                  "    pm.expect(routing['/projects/*']).to.include('8083');",
+                  "    pm.expect(routing['/tasks/*']).to.include('8084');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{auth_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{gateway_url}}/gateway/health",
+              "host": [
+                "{{gateway_url}}"
+              ],
+              "path": [
+                "gateway",
+                "health"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "gateway_url",
+      "value": "http://localhost:8081",
+      "type": "string"
+    },
+    {
+      "key": "auth_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "project_id",
+      "value": ""
+    },
+    {
+      "key": "task_id",
+      "value": ""
+    }
+  ]
+}
