@@ -218,7 +218,7 @@ func GetTasks(c *gin.Context) {
 		return
 	}
 
-	var taskList []gin.H
+	taskList := make([]gin.H, 0, len(tasks))
 	for _, task := range tasks {
 		taskList = append(taskList, gin.H{
 			"id":          task.ID,

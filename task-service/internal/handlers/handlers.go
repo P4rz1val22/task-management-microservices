@@ -198,7 +198,7 @@ func GetTasks(c *gin.Context) {
 	}
 
 	// Build enriched response with cross-service data
-	var taskList []gin.H
+	taskList := make([]gin.H, 0, len(tasks))
 	for _, task := range tasks {
 		taskList = append(taskList, gin.H{
 			"id":          task.ID,
