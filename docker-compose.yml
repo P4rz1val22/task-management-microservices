@@ -164,6 +164,37 @@ services:
     networks:
       - microservices
 
+  # Notification service (consumer only - no HTTP, no exposed port)
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: task-mgmt-notifications
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - KAFKA_TOPIC=task-events
+      # The consumer group name. The broker keys committed offsets on this
+      # exact string, so changing it resets the service to the start of the
+      # topic and re-notifies every task ever created.
+      - KAFKA_GROUP_ID=notification-service
+      # Unused in Stage 5; Stage 6 needs it to look up the recipient's address.
+      - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
+    depends_on:
+      # service_healthy here, unlike task-service. The asymmetry is the whole
+      # design: the producer must never wait on the broker, because a write path
+      # cannot take on a side effect's availability. A consumer has nothing to do
+      # until the broker is up, so waiting costs nothing and avoids a pointless
+      # crash loop on a cold boot.
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # No healthcheck: the service serves no HTTP, so there is nothing to probe.
+    # Liveness shows up in its logs and in the group's committed offsets.
+    restart: unless-stopped
+    networks:
+      - microservices
+
   # Kafka broker (KRaft mode - no Zookeeper)
   kafka:
     image: apache/kafka:3.9.0

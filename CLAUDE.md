@@ -4,7 +4,7 @@ A task management API mid-way through a Strangler Fig decomposition: a Go/Gin
 monolith is being carved into services behind an API gateway. Postgres for
 storage, Docker Compose for local orchestration.
 
-## Layout: five separate Go modules
+## Layout: six separate Go modules
 
 There is **no root Go module**, so `go test ./...` from the repo root does
 nothing. Every Go command must be run from inside a service directory.
@@ -16,11 +16,13 @@ nothing. Every Go command must be run from inside a service directory.
 | `project-service/` | `task-management-project-service`              |
 | `task-service/`    | `task-management-task-service`                 |
 | `gateway/`         | `task-management-gateway`                      |
+| `notification-service/` | `task-management-notification-service`    |
 
 To test everything:
 
 ```bash
-for m in monolith auth-service project-service task-service gateway; do
+for m in monolith auth-service project-service task-service gateway \
+         notification-service; do
   (cd "$m" && go test ./...)
 done
 ```
@@ -32,10 +34,11 @@ it; extract from it.
 
 ```bash
 docker compose up --build -d     # cold build across 5 modules takes minutes
-docker compose ps                # all 7 should read (healthy)
+docker compose ps                # 7 read (healthy); notification-service has
+                                 # no healthcheck and just reads "Up"
 ```
 
-Seven containers, all named `task-mgmt-*`:
+Eight containers, all named `task-mgmt-*`:
 
 | Service           | Container             | Host port |
 |-------------------|-----------------------|-----------|
@@ -46,6 +49,7 @@ Seven containers, all named `task-mgmt-*`:
 | `project-service` | `task-mgmt-projects`  | 8083      |
 | `task-service`    | `task-mgmt-tasks`     | 8084      |
 | `kafka`           | `task-mgmt-kafka`     | 9092      |
+| `notification-service` | `task-mgmt-notifications` | *(none)* |
 
 Postgres: user `postgres`, password `password123`, database `taskmanagement`.
 
@@ -55,7 +59,17 @@ docker compose exec postgres psql -U postgres -d taskmanagement -c '\dt'
 
 ## Health endpoints — two traps
 
-Each service serves `GET /health` on its own port. **The gateway does not.** It
+`notification-service` is the exception to everything in this section: it serves
+no HTTP at all, has no port and no healthcheck, so `docker compose ps` shows it
+as plain `Up` rather than `(healthy)`. That is correct, not a fault. To check it
+is alive, read its log prefix `[NOTIFICATION-SERVICE]` or its committed offsets:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --describe --group notification-service --bootstrap-server localhost:9092
+```
+
+Each other service serves `GET /health` on its own port. **The gateway does not.** It
 serves only `GET /gateway/health`. A request to `localhost:8081/health` falls
 through `r.NoRoute(proxy.SmartProxy())` and is answered by the *monolith*, so it
 returns a healthy-looking 200 that says nothing about the gateway.
@@ -93,7 +107,8 @@ This rules out `confluent-kafka-go` (use `segmentio/kafka-go`) and
 
 ## Testing
 
-Go tests exist only in `task-service/internal/events` so far. API-level
+Go tests live in `task-service/internal/events`, `task-service/internal/handlers`
+and `notification-service/internal/consumer`. API-level
 coverage lives in a Postman collection, `Task Management Microservices API`
 (17 requests, 15 assertions).
 

@@ -697,13 +697,56 @@ Add to Compose with `depends_on: kafka: condition: service_healthy` and the same
 Then `docker compose restart notification-service` and create another: it should pick up only
 the new event, not replay all four.
 
-- [ ] `handleEvent` tests written first and observed failing
-- [ ] Unknown-event-type and malformed-JSON cases pass
-- [ ] Events logged as they arrive
-- [ ] Restart does not replay already-consumed events
-- [ ] `docker compose stop notification-service`, create 2 tasks, start it again — both
+- [x] `HandleMessage` tests written first and observed failing on `undefined: Action`
+- [x] Unknown-event-type and malformed-JSON cases pass
+- [x] Events logged as they arrive
+- [x] Restart does not replay already-consumed events
+- [x] `docker compose stop notification-service`, create 2 tasks, start it again — both
       arrive. **This is the payoff of the whole design; see it work.**
-- [ ] Commit: `feat: notification-service consumer group with handler tests`
+- [x] Commit: `feat: notification-service consumer group with handler tests`
+
+**Shape.** The per-message decision (`HandleMessage`) is a pure function of the
+message bytes and holds every test; the loop (`Run`) owns connections, offsets
+and signals and makes no decisions. `HandleMessage` returns a `Result{Action,
+Summary}` rather than logging, so the loop can print a useful line without
+decoding the message a second time.
+
+**The contract is duplicated, not imported.** `notification-service/internal/events`
+is a hand-trimmed copy of the task-service package: separate Go modules, so there
+is no import path, and a `replace` directive would couple the build graphs this
+work exists to separate. The copy is deliberately *not* identical — it carries
+only the types a consumer needs, omitting the producer-side constructors and the
+`models.Task` import they require, which is what keeps gorm and any database
+dependency out of this service entirely. `TestDecodesProducerWireFormat` decodes
+a message captured verbatim from the Stage 4 console consumer, so a rename on the
+producer side fails here rather than silently arriving as a zero value.
+
+**Deliberate asymmetry in Compose.** `task-service` depends on Kafka with
+`service_started`; `notification-service` uses `service_healthy`. That is the
+design stated as configuration: a producer must never wait on the broker, because
+a write path cannot take on a side effect's availability, whereas a consumer has
+nothing to do until the broker is up and waiting costs it nothing. The consumer
+has no port and no healthcheck either — it serves no HTTP, so `docker compose ps`
+shows plain `Up`, and liveness is read from its logs or its committed offsets.
+
+**One trap, found and fixed.** The first version of the reader config tests called
+`NewReader`, which is side-effecting: kafka-go immediately spawns a goroutine to
+join the group and `Close` blocks until it finishes. The tests passed in 5.9s
+*because a broker happened to be running* — they had quietly become integration
+tests. Settings now live in a pure `readerConfig`, the suite runs in 0.4s, and it
+was re-verified with the entire stack stopped.
+
+**Observed end to end**, all four checks against the live stack:
+
+| Check | Result |
+|---|---|
+| Brand-new group starts | Picked up the 4-event backlog already on the topic (`StartOffset: FirstOffset`) |
+| Create 3 tasks | 3 log lines, one per event, across 3 partitions |
+| `restart notification-service` | **0** events replayed — committed offsets held |
+| `stop`, create 2 tasks, `start` | Both delivered on startup, nothing else replayed |
+| Garbage produced onto the topic | Both poison messages `DISCARDED`, offset committed, and a real event behind them processed — the partition did not wedge |
+
+Consumer group lag reads 0 on all three partitions.
 
 ---
 
