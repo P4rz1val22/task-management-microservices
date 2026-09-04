@@ -48,10 +48,31 @@ event is durably logged, and the consumer catches up on its own schedule. That i
 honest answer to the two design questions this work invites in an interview ("why not just
 call it?" and "what happens when the consumer is down?").
 
-**Goal state:** `task.created`, `task.updated`, and `task.deleted` events flow through
-Kafka; a new `notification-service` consumes them and sends the emails the monolith used to
-send inline. The three TODOs are gone, and every piece of that has a test that was written
-before it.
+**What Kafka is explicitly NOT buying here.** There is no throughput or scale problem to
+solve — this is a local seven-container stack with no production traffic. Anyone claiming Kafka
+here is about volume is overselling it. The justification is decoupling and reasoning about
+failure, and that justification is honest.
+
+**What the finished system will provide.** When Stages 1–9 are done, the observable end state
+is:
+
+1. **Task writes no longer depend on mail delivery.** Creating a task through the gateway
+   returns 201 whether the broker is up, down, or mid-restart. There is a Go test for exactly
+   this, and a Postman test that proves it end to end with Kafka stopped.
+2. **The dropped feature is restored on the new side of the migration.** Notification emails
+   fire again for task creation and updates — including a change summary listing exactly which
+   fields changed and nothing else — sent from a `notification-service` rather than from a
+   goroutine inside a request handler. All three TODOs are deleted.
+3. **A consumer that survives real failure.** It can be stopped, restarted, or crash
+   mid-processing without losing events or sending duplicate emails (deduped on `event_id`),
+   and one poison message will not wedge the partition (retry, then dead-letter topic).
+4. **Test coverage below the HTTP boundary, where there was none.** Go unit tests for the wire
+   contract, the partition key, the change-diffing rules, and the "publish failure still
+   returns 201" guarantee — complementing the existing 17-request Postman suite rather than
+   replacing it.
+5. **A gap we can articulate rather than hide.** Events are published after the DB commit, so
+   a crash between the two loses an event. The fix is a transactional outbox (Stage 8, item 3).
+   Whether or not it gets built, being able to name it is part of the deliverable.
 
 ---
 
