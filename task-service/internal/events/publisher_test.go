@@ -349,3 +349,102 @@ func TestWriterBatchTimeoutIsShort(t *testing.T) {
 		t.Errorf("BatchTimeout = %v, want <= 50ms so a single-message write flushes promptly", w.BatchTimeout)
 	}
 }
+
+// --- Stage 7: update and delete ---
+
+func TestPublishTaskUpdatedCarriesTheDiff(t *testing.T) {
+	f := &fakeWriter{}
+	p := newTestPublisher(f)
+
+	changes := []ChangeDetail{{Field: "Status", From: "Not Started", To: "Done"}}
+	if err := p.PublishTaskUpdated(context.Background(), sampleTask(), 7, changes); err != nil {
+		t.Fatalf("PublishTaskUpdated: %v", err)
+	}
+
+	var env Envelope
+	if err := json.Unmarshal(f.sent[0].Value, &env); err != nil {
+		t.Fatalf("value is not an envelope: %v", err)
+	}
+	if env.EventType != EventTaskUpdated {
+		t.Errorf("event_type = %q, want %q", env.EventType, EventTaskUpdated)
+	}
+	if len(env.Changes) != 1 || env.Changes[0].Field != "Status" {
+		t.Errorf("changes = %+v, want the Status diff", env.Changes)
+	}
+}
+
+func TestPublishTaskDeleted(t *testing.T) {
+	f := &fakeWriter{}
+	p := newTestPublisher(f)
+
+	if err := p.PublishTaskDeleted(context.Background(), sampleTask(), 7); err != nil {
+		t.Fatalf("PublishTaskDeleted: %v", err)
+	}
+
+	var env Envelope
+	if err := json.Unmarshal(f.sent[0].Value, &env); err != nil {
+		t.Fatalf("value is not an envelope: %v", err)
+	}
+	if env.EventType != EventTaskDeleted {
+		t.Errorf("event_type = %q, want %q", env.EventType, EventTaskDeleted)
+	}
+	if env.Changes != nil {
+		t.Errorf("changes = %+v on a delete, want absent", env.Changes)
+	}
+	// The task is gone from every query by now, so the event is the only
+	// remaining record of what it was.
+	if env.Task.Title != sampleTask().Title {
+		t.Errorf("delete event does not carry the task: %+v", env.Task)
+	}
+}
+
+// The point of the whole single-topic design, now finally demonstrable: all
+// three event types for one task must carry the same key, so they land on one
+// partition and are consumed in the order they happened. Until this stage only
+// one event type existed, so nothing could actually violate it.
+func TestAllEventTypesShareTheTaskKey(t *testing.T) {
+	f := &fakeWriter{}
+	p := newTestPublisher(f)
+	ctx := context.Background()
+	task := sampleTask()
+
+	if err := p.PublishTaskCreated(ctx, task, 7); err != nil {
+		t.Fatalf("created: %v", err)
+	}
+	if err := p.PublishTaskUpdated(ctx, task, 7, []ChangeDetail{{Field: "Status"}}); err != nil {
+		t.Fatalf("updated: %v", err)
+	}
+	if err := p.PublishTaskDeleted(ctx, task, 7); err != nil {
+		t.Fatalf("deleted: %v", err)
+	}
+
+	if len(f.sent) != 3 {
+		t.Fatalf("wrote %d messages, want 3", len(f.sent))
+	}
+	want := string(f.sent[0].Key)
+	if want != "42" {
+		t.Fatalf("key = %q, want the task ID", want)
+	}
+	for i, msg := range f.sent {
+		if got := string(msg.Key); got != want {
+			t.Errorf("message %d key = %q, want %q -- a task.updated could overtake "+
+				"its own task.created", i, got, want)
+		}
+	}
+}
+
+// Update and delete must propagate writer errors for the same reason create
+// does: the handler decides to ignore them, this layer does not.
+func TestUpdateAndDeleteErrorsPropagate(t *testing.T) {
+	boom := errors.New("broker unreachable")
+
+	p := newTestPublisher(&fakeWriter{err: boom})
+	if err := p.PublishTaskUpdated(context.Background(), sampleTask(), 7, nil); !errors.Is(err, boom) {
+		t.Errorf("update error = %v, want it to wrap %v", err, boom)
+	}
+
+	p = newTestPublisher(&fakeWriter{err: boom})
+	if err := p.PublishTaskDeleted(context.Background(), sampleTask(), 7); !errors.Is(err, boom) {
+		t.Errorf("delete error = %v, want it to wrap %v", err, boom)
+	}
+}

@@ -894,11 +894,62 @@ Skip publishing when `changes` is empty. Branch on `event_type` in the consumer;
 `task.deleted` has no existing email template — either add a small one or skip sending, and
 write down which in this file.
 
-- [ ] `DiffTask` tests written first and observed failing
-- [ ] No-op-update-publishes-nothing test passes
-- [ ] All three TODO comments now deleted from `handlers.go`
-- [ ] An update email lists exactly the fields that changed
-- [ ] Commit: `feat: publish task.updated and task.deleted events`
+- [x] `DiffTask` tests written first and observed failing
+- [x] No-op-update-publishes-nothing test passes
+- [x] All three TODO comments now deleted from `handlers.go` — `grep -rn TODO
+      task-service/internal/` returns nothing, and the commented-out
+      `originalTitle`/`originalStatus`/… block is gone with them
+- [x] An update email lists exactly the fields that changed
+- [x] Commit: `feat: publish task.updated and task.deleted events`
+
+**Diff scope widened past the monolith, deliberately.** The monolith compared
+four fields — Title, Status, Priority, Estimate — so editing a description, a due
+date, or moving a task between projects notified nobody. That reads more like an
+oversight than a decision, so `DiffTask` covers all seven user-visible fields.
+Bookkeeping columns stay out: `UpdatedAt` moves on every save, and counting it
+would make every no-op update look real and defeat the entire rule.
+
+**Deletion gets its own email.** The plan left this open. Building it turned out
+to be near-free — the HTML wrapper is already shared by the other two, so it is a
+content block and a subject line — and *not* building it would have left a bug:
+the consumer routed everything that was not an update to the **created**
+template, so a `task.deleted` would have emailed the user "New Task Created"
+about a task they had just deleted. Unreachable until this stage published
+deletes, at which point it becomes real. The switch is now explicitly exhaustive
+with a `default` that sends nothing, so a future event type cannot mail the wrong
+template.
+
+**Three rules worth their tests, all confirmed by mutation:**
+
+1. *Nothing changed means no event.* Forcing the handler to publish
+   unconditionally fails `TestUpdateWithNoChangesPublishesNothing` alone.
+2. *The diff is taken against the pre-update snapshot.* Diffing the task against
+   itself fails the two tests that check `from` values.
+3. *Due dates compare by value, not by pointer.* `DueDate` is a `*time.Time`, and
+   comparing pointers makes **every** diff report a spurious change — the
+   mutation failed even the "nothing changed" case, because each construction of
+   the fixture allocates a fresh pointer. A JSON round trip does exactly the same
+   thing. An unset date renders as the word `none`, never an address.
+
+**One thing the mocks surfaced about existing code.** `UpdateTask` loads the task
+with `Preload("Project")`, and GORM auto-saves loaded associations, so every task
+update also issues `INSERT INTO "projects" … ON CONFLICT DO NOTHING`. Harmless —
+the conflict clause makes it a no-op — but it is real, and the test harness
+models it rather than pretending otherwise.
+
+**Observed end to end**, one task through its whole life:
+
+| Request | Result |
+|---|---|
+| Create | `task.created`, partition 2, key 23 |
+| Update changing **nothing** | HTTP 200, **no event published at all** |
+| Update: status, priority, due date | `task.updated` listing exactly `Status(Not Started->Done) Priority(Low->Urgent) Due Date(none->2026-12-25)` |
+| Delete | `task.deleted`, deletion email — not the creation one |
+
+All three events landed on **partition 2 at consecutive offsets 8, 9, 10** under
+key `23`. That is the ordering guarantee the single-topic design was built for,
+visible for the first time: until this stage only one event type existed, so
+nothing could have violated it.
 
 ---
 

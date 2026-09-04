@@ -327,3 +327,86 @@ func TestMaskHidesCredentials(t *testing.T) {
 		t.Errorf("mask(\"\") = %q, want %q", got, "(not set)")
 	}
 }
+
+// --- Stage 7: deletion ---
+
+// Before this stage the consumer routed anything that was not an update to the
+// created template, so a task.deleted event would have told the user their
+// deleted task had just been created. Nothing published deletes, so it was
+// unreachable -- Stage 7 makes it reachable, which is why the branch and this
+// template exist.
+func TestDeletedEmailNamesTheTaskAndSaysDeleted(t *testing.T) {
+	f := &fakeSender{}
+	svc := configured(f)
+
+	task := samplePayload()
+	if err := svc.SendTaskDeletedNotification(task, "user@example.com"); err != nil {
+		t.Fatalf("SendTaskDeletedNotification: %v", err)
+	}
+
+	msg := f.lastBody(t)
+	if !strings.Contains(msg, task.Title) {
+		t.Errorf("deleted email does not name the task")
+	}
+	for _, want := range []string{"Deleted", "To: user@example.com", "<!DOCTYPE html>"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("deleted email is missing %q", want)
+		}
+	}
+}
+
+// The three emails must be distinguishable. A deletion that reads like a
+// creation is worse than no email at all.
+func TestThreeEmailsAreDistinct(t *testing.T) {
+	f := &fakeSender{}
+	svc := configured(f)
+	task := samplePayload()
+
+	if err := svc.SendTaskCreatedNotification(task, "u@e.com"); err != nil {
+		t.Fatalf("created: %v", err)
+	}
+	created := f.lastBody(t)
+
+	if err := svc.SendTaskUpdatedNotification(task, "u@e.com", nil); err != nil {
+		t.Fatalf("updated: %v", err)
+	}
+	updated := f.lastBody(t)
+
+	if err := svc.SendTaskDeletedNotification(task, "u@e.com"); err != nil {
+		t.Fatalf("deleted: %v", err)
+	}
+	deleted := f.lastBody(t)
+
+	if created == updated || created == deleted || updated == deleted {
+		t.Error("two of the three emails render identically")
+	}
+	if strings.Contains(deleted, "New Task Created") {
+		t.Error("the deletion email claims the task was created")
+	}
+	if strings.Contains(deleted, "Ready to get started") {
+		t.Error("the deletion email invites the user to start the task they deleted")
+	}
+}
+
+// A deletion email carries no change list -- there is no "from" and "to" when
+// the whole thing is gone.
+func TestDeletedEmailHasNoChangeList(t *testing.T) {
+	f := &fakeSender{}
+	svc := configured(f)
+
+	if err := svc.SendTaskDeletedNotification(samplePayload(), "u@e.com"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if strings.Contains(f.lastBody(t), "What Changed") {
+		t.Error("the deletion email renders a change list")
+	}
+}
+
+func TestDeletedSendErrorsPropagate(t *testing.T) {
+	boom := errors.New("smtp: connection refused")
+	svc := configured(&fakeSender{err: boom})
+
+	if err := svc.SendTaskDeletedNotification(samplePayload(), "u@e.com"); !errors.Is(err, boom) {
+		t.Errorf("error = %v, want it to wrap %v", err, boom)
+	}
+}

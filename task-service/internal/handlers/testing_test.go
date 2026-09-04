@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"task-management-task-service/internal/database"
+	"task-management-task-service/internal/events"
 	"task-management-task-service/internal/models"
 )
 
@@ -116,8 +117,10 @@ func newTestContext(t *testing.T, body string) (*gin.Context, *httptest.Response
 // client hanging up does not cancel a legitimate event, and that a wedged broker
 // cannot pin the handler open forever.
 type publishCall struct {
-	task    models.Task
-	actorID uint
+	eventType string
+	task      models.Task
+	actorID   uint
+	changes   []events.ChangeDetail
 
 	// Captured at call time, not read from a retained context afterwards. The
 	// handler wraps its publish in a defer cancel(), so by the time a test
@@ -136,16 +139,30 @@ type fakePublisher struct {
 	err   error
 }
 
-func (f *fakePublisher) PublishTaskCreated(ctx context.Context, task models.Task, actorID uint) error {
+func (f *fakePublisher) record(ctx context.Context, eventType string, task models.Task, actorID uint, changes []events.ChangeDetail) error {
 	deadline, hasDeadline := ctx.Deadline()
 	f.calls = append(f.calls, publishCall{
+		eventType:   eventType,
 		task:        task,
 		actorID:     actorID,
+		changes:     changes,
 		ctxErr:      ctx.Err(),
 		deadline:    deadline,
 		hasDeadline: hasDeadline,
 	})
 	return f.err
+}
+
+func (f *fakePublisher) PublishTaskCreated(ctx context.Context, task models.Task, actorID uint) error {
+	return f.record(ctx, events.EventTaskCreated, task, actorID, nil)
+}
+
+func (f *fakePublisher) PublishTaskUpdated(ctx context.Context, task models.Task, actorID uint, changes []events.ChangeDetail) error {
+	return f.record(ctx, events.EventTaskUpdated, task, actorID, changes)
+}
+
+func (f *fakePublisher) PublishTaskDeleted(ctx context.Context, task models.Task, actorID uint) error {
+	return f.record(ctx, events.EventTaskDeleted, task, actorID, nil)
 }
 
 // usePublisher installs a fake for the duration of one test and restores the
@@ -167,4 +184,83 @@ func TestMockDBOpensCleanly(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("gorm.Open issued unexpected queries: %v", err)
 	}
+}
+
+// expectOwnedTaskForUpdate queues the authorisation lookup UpdateTask and
+// DeleteTask both perform: the task joined to its project, checked against the
+// caller. Preload("Project") makes it two queries, not one.
+func expectOwnedTask(mock sqlmock.Sqlmock, task models.Task) {
+	mock.ExpectQuery(`SELECT .* FROM "tasks"`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "title", "description", "project_id", "assignee_id",
+			"creator_id", "status", "priority", "estimate", "due_date",
+		}).AddRow(task.ID, task.Title, task.Description, task.ProjectID,
+			testActorID, testActorID, task.Status, task.Priority,
+			task.Estimate, task.DueDate))
+
+	mock.ExpectQuery(`SELECT .* FROM "projects"`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "owner_id"}).
+			AddRow(task.ProjectID, "Test project", testActorID))
+}
+
+// expectTaskSave queues what GORM's Save actually emits for a task whose
+// Project association was preloaded.
+//
+// The projects upsert is not a mistake in this harness. UpdateTask loads the
+// task with Preload("Project"), and GORM auto-saves loaded associations, so
+// every task update also issues an INSERT ... ON CONFLICT DO NOTHING against
+// projects. It is harmless -- the conflict clause makes it a no-op -- but it is
+// what the handler does, and a mock that pretended otherwise would not be
+// testing the handler.
+func expectTaskSave(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO "projects"`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(3))
+	mock.ExpectExec(`UPDATE "tasks"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+}
+
+// expectTaskDelete queues the soft delete: gorm.DeletedAt on the model turns
+// Delete into an UPDATE that sets deleted_at rather than a DELETE.
+func expectTaskDelete(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE "tasks" SET "deleted_at"`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+}
+
+// existingTask is the task the mocks above hand back.
+func existingTask() models.Task {
+	due := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	return models.Task{
+		ID:          42,
+		Title:       "Original title",
+		Description: "Original description",
+		ProjectID:   3,
+		Status:      "Not Started",
+		Priority:    "Low",
+		Estimate:    "S",
+		DueDate:     &due,
+	}
+}
+
+// ginParams builds the URL parameter list a handler reads via c.Param, since
+// tests invoke handlers directly rather than through the router.
+func ginParams(kv ...string) gin.Params {
+	params := make(gin.Params, 0, len(kv)/2)
+	for i := 0; i+1 < len(kv); i += 2 {
+		params = append(params, gin.Param{Key: kv[i], Value: kv[i+1]})
+	}
+	return params
+}
+
+// mockEmptyTaskRows is a task query that finds nothing, which GORM turns into
+// ErrRecordNotFound and the handlers turn into a 404.
+func mockEmptyTaskRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "title", "project_id", "assignee_id"})
+}
+
+// sqlmockRows is a one-row shorthand for the small fixtures above.
+func sqlmockRows(column, value string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{column}).AddRow(value)
 }

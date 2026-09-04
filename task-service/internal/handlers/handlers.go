@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"task-management-task-service/internal/database"
+	"task-management-task-service/internal/events"
 	"task-management-task-service/internal/models"
 )
 
@@ -18,6 +19,8 @@ import (
 // that records calls.
 type eventPublisher interface {
 	PublishTaskCreated(ctx context.Context, task models.Task, actorID uint) error
+	PublishTaskUpdated(ctx context.Context, task models.Task, actorID uint, changes []events.ChangeDetail) error
+	PublishTaskDeleted(ctx context.Context, task models.Task, actorID uint) error
 }
 
 // publishTimeout bounds how long a write may wait on the broker before giving up
@@ -42,6 +45,16 @@ type noopPublisher struct{}
 
 func (noopPublisher) PublishTaskCreated(_ context.Context, task models.Task, _ uint) error {
 	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.created for task %d", task.ID)
+	return nil
+}
+
+func (noopPublisher) PublishTaskUpdated(_ context.Context, task models.Task, _ uint, _ []events.ChangeDetail) error {
+	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.updated for task %d", task.ID)
+	return nil
+}
+
+func (noopPublisher) PublishTaskDeleted(_ context.Context, task models.Task, _ uint) error {
+	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.deleted for task %d", task.ID)
 	return nil
 }
 
@@ -371,11 +384,14 @@ func UpdateTask(c *gin.Context) {
 		dueDate = &parsed
 	}
 
-	// Track changes for notification (future use)
-	//originalTitle := task.Title
-	//originalStatus := task.Status
-	//originalPriority := task.Priority
-	//originalEstimate := task.Estimate
+	// Snapshot the task before the request is applied. The diff has to be taken
+	// against these values -- comparing after the assignments below would
+	// compare the task to itself and every update would look like a no-op.
+	//
+	// A struct copy is enough. DueDate is a pointer, but the assignment below
+	// replaces it with a different pointer rather than writing through the old
+	// one, so the snapshot keeps pointing at the original date.
+	before := task
 
 	// Update task
 	task.Title = req.Title
@@ -391,8 +407,20 @@ func UpdateTask(c *gin.Context) {
 		return
 	}
 
-	// TODO: Send change notification to Notification Service
-	// Track what changed: originalTitle vs task.Title, etc.
+	// Publish task.updated, but only if something actually changed. Hitting
+	// save without editing anything is something users do constantly, and it
+	// must not produce an event or an email -- events.DiffTask returning an
+	// empty slice is what encodes that, and
+	// TestUpdateWithNoChangesPublishesNothing is what holds it in place.
+	if changes := events.DiffTask(before, task); len(changes) > 0 {
+		publishCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancel()
+		if err := Publisher.PublishTaskUpdated(publishCtx, task, userID, changes); err != nil {
+			// Logged, never fatal -- same reasoning as the create path. The
+			// task is saved and the caller gets its 200.
+			log.Printf("[TASK-SERVICE] publish task.updated for task %d: %v", task.ID, err)
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Task updated successfully",
@@ -429,6 +457,16 @@ func DeleteTask(c *gin.Context) {
 	if err := database.DB.Delete(&task).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete task"})
 		return
+	}
+
+	// Publish task.deleted. The envelope carries the whole task, which matters
+	// more here than on any other path: the row is filtered out of every query
+	// from this point on, so the event is the only remaining description of
+	// what was deleted.
+	publishCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
+	defer cancel()
+	if err := Publisher.PublishTaskDeleted(publishCtx, task, userID); err != nil {
+		log.Printf("[TASK-SERVICE] publish task.deleted for task %d: %v", task.ID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

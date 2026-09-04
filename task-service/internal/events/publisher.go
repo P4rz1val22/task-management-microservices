@@ -131,6 +131,23 @@ func (p *Publisher) PublishTaskCreated(ctx context.Context, task models.Task, ac
 	return p.publish(ctx, NewTaskCreated(task, actorID))
 }
 
+// PublishTaskUpdated publishes a task.updated event carrying the diff.
+//
+// Callers must not call this with an empty changes slice: an update that
+// changed nothing should produce no event at all. That decision belongs to the
+// handler, where a reader can see it, not to this layer.
+func (p *Publisher) PublishTaskUpdated(ctx context.Context, task models.Task, actorID uint, changes []ChangeDetail) error {
+	return p.publish(ctx, NewTaskUpdated(task, actorID, changes))
+}
+
+// PublishTaskDeleted publishes a task.deleted event.
+//
+// Published after the row is deleted, so the envelope's copy of the task is the
+// only description of it a consumer can still get.
+func (p *Publisher) PublishTaskDeleted(ctx context.Context, task models.Task, actorID uint) error {
+	return p.publish(ctx, NewTaskDeleted(task, actorID))
+}
+
 func (p *Publisher) publish(ctx context.Context, env Envelope) error {
 	value, err := json.Marshal(env)
 	if err != nil {

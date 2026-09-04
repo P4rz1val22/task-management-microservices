@@ -72,6 +72,7 @@ type Result struct {
 type mailer interface {
 	SendTaskCreatedNotification(task events.TaskPayload, to string) error
 	SendTaskUpdatedNotification(task events.TaskPayload, to string, changes []events.ChangeDetail) error
+	SendTaskDeletedNotification(task events.TaskPayload, to string) error
 }
 
 // Handler processes one event at a time.
@@ -147,13 +148,23 @@ func (h *Handler) notify(ctx context.Context, env events.Envelope) error {
 		return err
 	}
 
+	// Explicitly exhaustive, with no default that sends mail. An earlier
+	// version routed everything that was not an update to the created
+	// template, which meant a task.deleted would have told the user their
+	// deleted task had just been created. Only unreachable because nothing
+	// published deletes; publishing them is what made it real.
 	switch env.EventType {
+	case events.EventTaskCreated:
+		return h.Mailer.SendTaskCreatedNotification(env.Task, to)
 	case events.EventTaskUpdated:
 		return h.Mailer.SendTaskUpdatedNotification(env.Task, to, env.Changes)
+	case events.EventTaskDeleted:
+		return h.Mailer.SendTaskDeletedNotification(env.Task, to)
 	default:
-		// Created and deleted both use the created template for now. Stage 7
-		// decides whether task.deleted gets one of its own.
-		return h.Mailer.SendTaskCreatedNotification(env.Task, to)
+		// Unreachable: HandleMessage has already skipped unknown types. Send
+		// nothing rather than guess, so a future event type added upstream can
+		// never mail the wrong template.
+		return nil
 	}
 }
 

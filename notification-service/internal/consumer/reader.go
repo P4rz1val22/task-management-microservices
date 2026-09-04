@@ -199,10 +199,30 @@ func Run(ctx context.Context, reader *kafka.Reader, h *Handler) error {
 		case handleErr != nil:
 			// Transient, and it survived every retry. The offset is still
 			// committed, so this event IS LOST -- said plainly because it is a
-			// real hole, not a shrug. Stage 8 replaces this branch with a
-			// dead-letter publish, which is what makes it recoverable. Not
-			// committing instead would wedge the partition and lose every event
-			// behind it too, which is strictly worse.
+			// real hole, not a shrug.
+			//
+			// Note what this branch does NOT justify. Refusing to commit and
+			// blocking instead would not "lose everything behind it": anything
+			// reaching here failed for a reason unrelated to the message (the
+			// database or the mail server is down), so the events behind it
+			// would fail too and there is no useful work being blocked. A
+			// permanent, message-specific failure takes the ErrBadMessage
+			// branch above and never arrives here.
+			//
+			// Blocking is therefore a legitimate alternative, and with the
+			// current window -- maxProcessAttempts * processRetryDelay, about a
+			// second -- a routine Postgres restart is long enough to drop
+			// in-flight notifications. The reason this stays as it is: Stage 8
+			// replaces the whole branch with a dead-letter publish, which keeps
+			// the event AND keeps the partition moving. Widening the retry
+			// window here would be work that stage deletes.
+			//
+			// The one case blocking genuinely cannot handle, and the reason the
+			// dead-letter topic is the real answer: a failure that looks
+			// transient but is specific to one message -- a mail server
+			// permanently rejecting one malformed address -- would stall this
+			// loop indefinitely, and since the loop is sequential that stalls
+			// every partition this consumer owns, not just one.
 			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d EVENT LOST after %d attempts: %v",
 				msg.Partition, msg.Offset, maxProcessAttempts, handleErr)
 		default:

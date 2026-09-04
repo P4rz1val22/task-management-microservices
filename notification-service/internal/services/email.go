@@ -216,6 +216,52 @@ func (e *EmailService) SendTaskUpdatedNotification(task events.TaskPayload, user
 	return e.sendEmail(userEmail, subject, body)
 }
 
+// SendTaskDeletedNotification renders and sends the task-removed email.
+//
+// New in Stage 7 and the only one of the three with no counterpart in the
+// monolith, which never notified on deletion at all. It reuses the shared
+// template wrapper, so it is a content block rather than a new design.
+//
+// It carries the task's details because by the time this is sent the row is
+// filtered out of every query -- the event is the only remaining record of what
+// the task was, so the email is the user's last chance to see it.
+func (e *EmailService) SendTaskDeletedNotification(task events.TaskPayload, userEmail string) error {
+	subject := fmt.Sprintf("🗑️ Task Deleted: %s", task.Title)
+	body := e.createEmailTemplate("Task Deleted", fmt.Sprintf(`
+        <div class="content-section">
+            <h3 style="color: #dc2626; margin: 0 0 16px 0;">🗑️ Removed Task</h3>
+            <div class="detail-row">
+                <span class="label">Title:</span>
+                <span class="value">%s</span>
+            </div>
+            <div class="detail-row">
+                <span class="label">Description:</span>
+                <span class="value">%s</span>
+            </div>
+            <div class="detail-row">
+                <span class="label">Status when deleted:</span>
+                <span class="status-badge status-%s">%s</span>
+            </div>
+            %s
+            %s
+        </div>
+        <div class="content-section">
+            <p style="margin: 0; color: #6b7280;">
+                This task is no longer on your board. Nothing further is needed from you.
+            </p>
+        </div>
+    `,
+		task.Title,
+		e.getDisplayValue(task.Description, "No description"),
+		strings.ToLower(strings.ReplaceAll(task.Status, " ", "-")),
+		task.Status,
+		e.getPriorityHTML(task.Priority),
+		e.getEstimateHTML(task.Estimate),
+	))
+
+	return e.sendEmail(userEmail, subject, body)
+}
+
 func (e *EmailService) createEmailTemplate(title, content string) string {
 	return fmt.Sprintf(`
 <!DOCTYPE html>

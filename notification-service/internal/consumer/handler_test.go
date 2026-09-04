@@ -269,6 +269,7 @@ func (f *fakeLookup) EmailFor(_ context.Context, userID uint) (string, error) {
 type fakeMailer struct {
 	created []string // recipient per created-email call
 	updated []string
+	deleted []string
 	changes [][]events.ChangeDetail
 	err     error
 }
@@ -281,6 +282,11 @@ func (f *fakeMailer) SendTaskCreatedNotification(_ events.TaskPayload, to string
 func (f *fakeMailer) SendTaskUpdatedNotification(_ events.TaskPayload, to string, ch []events.ChangeDetail) error {
 	f.updated = append(f.updated, to)
 	f.changes = append(f.changes, ch)
+	return f.err
+}
+
+func (f *fakeMailer) SendTaskDeletedNotification(_ events.TaskPayload, to string) error {
+	f.deleted = append(f.deleted, to)
 	return f.err
 }
 
@@ -500,5 +506,70 @@ func TestRetryStopsOnContextCancel(t *testing.T) {
 	}
 	if c.calls > 1 {
 		t.Errorf("handler called %d times with a cancelled context, want 1", c.calls)
+	}
+}
+
+// Before Stage 7 the handler routed everything that was not an update to the
+// created template, so this event would have emailed the user "New Task
+// Created" about a task they had just deleted. Nothing published deletes, so it
+// was unreachable -- publishing them is what makes this test necessary.
+func TestDeletedEventSendsTheDeletionEmail(t *testing.T) {
+	lookup := &fakeLookup{email: "demo@example.com"}
+	mailer := &fakeMailer{}
+	h := wired(lookup, mailer)
+
+	res, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskDeleted)))
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if res.Action != ActionNotified {
+		t.Errorf("action = %v, want notified", res.Action)
+	}
+	if len(mailer.deleted) != 1 || mailer.deleted[0] != "demo@example.com" {
+		t.Errorf("deletion email sent to %v, want [demo@example.com]", mailer.deleted)
+	}
+	if len(mailer.created) != 0 {
+		t.Error("a deletion sent the CREATED email; the user would be told their " +
+			"deleted task was just created")
+	}
+	if len(mailer.updated) != 0 {
+		t.Error("a deletion sent the updated email")
+	}
+}
+
+// Each of the three event types must reach its own template, and only its own.
+func TestEachEventTypeRoutesToItsOwnEmail(t *testing.T) {
+	tests := []struct {
+		eventType string
+		created   int
+		updated   int
+		deleted   int
+	}{
+		{events.EventTaskCreated, 1, 0, 0},
+		{events.EventTaskUpdated, 0, 1, 0},
+		{events.EventTaskDeleted, 0, 0, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.eventType, func(t *testing.T) {
+			mailer := &fakeMailer{}
+			h := wired(&fakeLookup{email: "demo@example.com"}, mailer)
+
+			if _, err := h.HandleMessage(context.Background(),
+				mustJSON(t, sampleEnvelope(tt.eventType))); err != nil {
+				t.Fatalf("HandleMessage: %v", err)
+			}
+
+			if len(mailer.created) != tt.created {
+				t.Errorf("created emails = %d, want %d", len(mailer.created), tt.created)
+			}
+			if len(mailer.updated) != tt.updated {
+				t.Errorf("updated emails = %d, want %d", len(mailer.updated), tt.updated)
+			}
+			if len(mailer.deleted) != tt.deleted {
+				t.Errorf("deleted emails = %d, want %d", len(mailer.deleted), tt.deleted)
+			}
+		})
 	}
 }
