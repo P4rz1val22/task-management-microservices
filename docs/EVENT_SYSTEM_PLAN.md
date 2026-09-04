@@ -1,0 +1,757 @@
+# Plan: Finish the Strangler Fig migration with a Kafka event backbone
+
+Working plan for pairing with Claude Code. Each stage is independently runnable,
+verifiable, and committable — start a session, do one stage, commit, stop.
+
+**Every stage that produces Go code writes its test first.** The stage's first checkbox is
+always "the new test fails, and fails for the right reason." Section 4 explains why that
+discipline is load-bearing here and not ceremony.
+
+Clean `main` at `157beff` when this plan was written. Work on a branch:
+
+```bash
+git checkout -b feat/kafka-event-system
+```
+
+---
+
+## 1. Context: why this exists
+
+This is not "add Kafka to get a keyword." The decomposition in this repo is genuinely
+unfinished, and the repo says so itself.
+
+The monolith sends task notification emails from an inline goroutine:
+
+- `monolith/internal/handlers/task.go:121` — `go func()` on task create
+- `monolith/internal/handlers/task.go:377` — `go func()` on task update
+- `monolith/internal/services/email.go` — a complete `EmailService`: SMTP, HTML
+  templates, change diffing via `ChangeDetail`, priority/estimate/status rendering
+
+The extracted `task-service` dropped that capability entirely and left TODOs behind:
+
+- `task-service/internal/handlers/handlers.go:112` — `// TODO: Send notification to
+  Notification Service (future microservice)` / `// For now, we skip the email notification`
+- `task-service/internal/handlers/handlers.go:322` — `// Track changes for notification
+  (future use)` with `originalTitle`/`originalStatus`/`originalPriority`/`originalEstimate`
+  commented out
+- `task-service/internal/handlers/handlers.go:342` — `// TODO: Send change notification to
+  Notification Service`
+
+So the migration traded a working feature for a TODO. This plan builds the notification
+service those TODOs point at.
+
+**Why events rather than an HTTP call to the notification service:** if `task-service`
+called it directly, an SMTP outage or a down notification service would fail or block task
+creation — a write path taking on the availability of a non-critical side effect. Publishing
+an event decouples them: `task-service` returns as soon as the task is committed and the
+event is durably logged, and the consumer catches up on its own schedule. That is also the
+honest answer to the two design questions this work invites in an interview ("why not just
+call it?" and "what happens when the consumer is down?").
+
+**Goal state:** `task.created`, `task.updated`, and `task.deleted` events flow through
+Kafka; a new `notification-service` consumes them and sends the emails the monolith used to
+send inline. The three TODOs are gone, and every piece of that has a test that was written
+before it.
+
+---
+
+## 2. Two decisions already made, and why
+
+**Kafka in KRaft mode, single container, `apache/kafka:3.9.0`.** No Zookeeper. Modern Kafka
+does not need it, and a second container buys nothing here.
+
+**`github.com/segmentio/kafka-go`, NOT `confluent-kafka-go`.** This matters and is easy to
+get wrong. Every Dockerfile in this repo builds with `CGO_ENABLED=0` on Alpine (see
+`task-service/Dockerfile`). `confluent-kafka-go` wraps the C library `librdkafka` and
+requires cgo, so choosing it means rewriting every Dockerfile and fighting Alpine's musl
+libc. `segmentio/kafka-go` is pure Go and drops straight into the existing build with no
+Dockerfile changes. If a future session suggests switching to `confluent-kafka-go`, this is
+the reason not to.
+
+There is a second, test-specific reason to prefer it: `kafka-go`'s writer is an ordinary Go
+struct behind an interface you can define yourself, so the publisher is unit-testable with a
+hand-written fake and no broker. A cgo client is much harder to fake.
+
+---
+
+## 3. Event contract
+
+One topic, `task-events`, carrying all three event types. Not three topics — a single topic
+partitioned by task ID guarantees that events for the same task are consumed in the order
+they happened, which is exactly the ordering guarantee that matters here. Three topics would
+let a `task.updated` overtake its own `task.created`.
+
+- **Topic:** `task-events`
+- **Partition key:** the task ID as a string. Same task, same partition, ordered.
+- **Value:** JSON envelope below.
+
+```json
+{
+  "event_id":   "uuid-v4",
+  "event_type": "task.created",
+  "occurred_at": "2026-09-04T14:03:11Z",
+  "task_id":    42,
+  "actor_id":   7,
+  "task": {
+    "id": 42, "title": "...", "description": "...", "project_id": 3,
+    "status": "In Progress", "priority": "High", "estimate": "M",
+    "due_date": "2026-09-30T00:00:00Z"
+  },
+  "changes": [
+    { "field": "Status", "from": "Not Started", "to": "In Progress" }
+  ]
+}
+```
+
+Notes on the shape:
+
+- `event_id` exists so the consumer can dedupe. Kafka is at-least-once: a consumer that
+  crashes after sending an email but before committing its offset will see that event again
+  on restart. Without dedupe, that is a duplicate email.
+- `changes` is populated only on `task.updated`, and maps 1:1 onto the existing
+  `services.ChangeDetail` struct in `monolith/internal/services/email.go` — deliberately, so
+  the email service can be reused with no changes to its signature.
+- `actor_id` is the `user_id` the handlers already read via `c.GetUint("user_id")`. The
+  consumer needs it to look up the recipient's email.
+- The event carries the whole task, so the consumer never has to call back into
+  `task-service`. Keep it that way.
+
+This contract is what Stage 2 encodes in a test **before** any producer or consumer exists.
+Once two services depend on these exact JSON field names, changing them is a coordinated
+deploy; the test is what makes an accidental rename fail loudly instead of silently
+delivering `null` to the consumer.
+
+---
+
+## 4. Testing strategy (read before Stage 0)
+
+This project is not untested — it is tested at the HTTP boundary, and the existing suite is
+real work. What it has no coverage of is anything below that boundary, which is precisely
+where the event system lives.
+
+**What exists today.** A Postman collection, `Task Management Microservices API` (schema
+v2.1.0) — 17 requests across 7 folders with 15 `pm.test()` blocks, plus a larger companion
+collection for the monolith.
+
+Where it lives matters for Stage 9. Postman 11.x is the web app in an Electron shell (the
+desktop app loads `https://desktop.postman.com/` behind a service worker), so collections are
+cloud objects tied to the account and workspace, not local files — the entire local IndexedDB
+store is ~140KB of session state. The only copy on disk is a manual export at
+`~/Downloads/postman_testing_suite_exports/Task Management Microservices API.postman_collection.json`,
+dated 2025-08-25, which may already have drifted from the live collection.
+
+The assertions are genuine rather than status-code-only: `Create
+Task` checks that the response body carries an `id` and that the echoed title matches what
+was sent, and the suite chains `auth_token`, `project_id`, and `task_id` through collection
+variables so the folders run in sequence as a real workflow. Match that style in Stage 9.
+
+Two gaps in it worth naming, neither of which this plan fixes: it exercises happy paths only,
+so the validation rejections in `task-service` (bad status, priority, estimate) and the
+401/404 paths are unasserted; and three of the four direct service-health requests have no
+test block at all. Also, the collection lives in `~/Downloads`, not in git, so it is a
+snapshot that can silently drift from the code or be lost — Stage 9 commits it into the repo.
+
+**What does not exist** is any `*_test.go` file, in any service. So the Go harness has to be
+established alongside the first feature rather than assumed, and there is no existing Go
+convention to match — the conventions are set here.
+
+### Why test-first genuinely pays here, not just as discipline
+
+Most of this work is *pure data transformation* — build an envelope from a task, diff an old
+task against a new one, decide whether an event is worth publishing. That code has no I/O in
+it, takes plain structs in and plain structs out, and is the exact shape where writing the
+assertion first is easy and shapes the design. The rule "a no-op update publishes nothing"
+is a one-line test and an unenforceable comment; writing the test first is what makes it the
+former.
+
+Test-first also forces the seam that the current code lacks. `task-service`'s handlers call
+the package-level global `database.DB` directly (`task-service/internal/database/database.go`
+declares `var DB *gorm.DB`). If the publisher is added the same way — a second global, called
+inline — nothing about it is testable. Writing the handler test first makes you inject a
+`Publisher` interface, which is both the testable design and the better one.
+
+### Three layers, and what lives at each
+
+**Layer 1 — pure unit tests. No DB, no broker, no network.** The event envelope, its JSON
+serialization, and the change-diffing logic. These run in milliseconds with `go test ./...`
+and are the majority of the tests in this plan. Stages 2, 5, 7 are almost entirely here.
+
+**Layer 2 — fake-collaborator tests.** A `Publisher` interface with a hand-written fake that
+records what it was asked to publish; a `sender` interface for email. These assert *behavior
+at a boundary*: "creating a task publishes exactly one `task.created` whose key is the task
+ID," "a publish failure still returns 201." Where a handler test needs the database, use
+`github.com/DATA-DOG/go-sqlmock` driving the existing gorm postgres driver:
+
+```go
+sqlDB, mock, _ := sqlmock.New()
+gdb, _ := gorm.Open(postgres.New(postgres.Config{
+    Conn:                 sqlDB,
+    PreferSimpleProtocol: true,
+}), &gorm.Config{})
+database.DB = gdb // restore in t.Cleanup
+```
+
+Two gotchas worth knowing before you fight them: gorm's `Create` against Postgres emits
+`INSERT ... RETURNING "id"`, so it needs `mock.ExpectQuery(...)` wrapped in `ExpectBegin()`
+/ `ExpectCommit()`, not `ExpectExec`. And when the expectation does not match, sqlmock's
+error message prints the actual SQL — read it and paste it into the expectation rather than
+guessing.
+
+**Do not reach for a SQLite test database instead.** `gorm.io/driver/sqlite` requires cgo,
+which is exactly the dependency section 2 chose `kafka-go` to avoid; the pure-Go
+`glebarez/sqlite` fork works but silently differs from Postgres on the `RETURNING` behavior
+above, which makes the test lie about what production does.
+
+**Layer 3 — integration tests, behind a build tag.** Real broker, real Postgres, via the
+Compose stack. Every such file starts with:
+
+```go
+//go:build integration
+```
+
+and is run explicitly with `go test -tags=integration ./...`. This is the important part:
+`go test ./...` must stay fast and require no Docker, so it can run on a plane and in CI
+without a service matrix. Integration tests are the only place a real broker appears.
+
+### What is deliberately NOT unit tested
+
+Naming this is as valuable as the tests themselves, because the alternative is fake tests
+that mock a broker and assert that the mock was called:
+
+- **Broker configuration** (Stage 1). A KRaft listener config is verified by the broker
+  starting and `kafka-topics.sh` succeeding. A Go test asserting the contents of a YAML file
+  tests nothing.
+- **Consumer-group offset semantics** (Stage 5). That offsets survive a restart and that a
+  stopped consumer catches up is a property of Kafka, not of this code. It is verified by
+  hand with `docker compose stop` / `start`, and that manual check is the payoff of the whole
+  design — see it with your own eyes.
+- **Real SMTP delivery** (Stage 6). Tested against a fake sender; that a real mail server
+  accepts the message is verified once, manually, with real credentials.
+
+### Harness conventions
+
+Add a `test` and `test-integration` target to the `Makefile` (create one if the repo has
+none — it makes the two-tier split discoverable instead of tribal knowledge):
+
+```make
+test:
+	cd task-service && go test ./... && cd ../notification-service && go test ./...
+
+test-integration:
+	cd task-service && go test -tags=integration ./...
+```
+
+Each service is a separate Go module, so there is no repo-root `go test ./...` that covers
+everything — the `Makefile` is what papers over that.
+
+---
+
+## 5. Stages
+
+Ten stages, 0 through 9. Each Go-code stage follows the same rhythm:
+
+> **RED** — write the test, run it, watch it fail for the reason you predicted.
+> **GREEN** — write the smallest implementation that passes.
+> **COMMIT** — one commit with both, so the diff shows the test and the code that satisfies it.
+
+Committing the test and implementation together is deliberate: a reviewer (or you, in six
+months) can see the assertion next to the behavior. Committing tests separately just to prove
+you wrote them first is theater.
+
+---
+
+### Stage 0 — Baseline (no code)
+
+Confirm the stack runs before changing anything, so a later failure is attributable.
+
+**Startup here is racy, so poll before you believe anything.** None of the five Go services
+define a healthcheck, and the gateway's `depends_on` has no `condition:` clause
+(`docker-compose.yml:114-118`), so the gateway accepts traffic on 8081 while the backends are
+still migrating. Worse, all four Go services run GORM `AutoMigrate` against overlapping tables
+the moment Postgres reports healthy, which can deadlock into `log.Fatal`. `restart:
+unless-stopped` recovers it, so **a container that flaps once on first boot is expected, not
+broken** — read its logs and confirm it was the migration race before treating it as a fault.
+
+```bash
+docker compose up --build -d          # cold build across 5 Go modules: budget several minutes
+docker compose ps                     # expect 6 containers; check the RESTARTS column
+docker compose logs postgres | tail   # confirm pg_isready passed
+```
+
+Then health-check each service directly, and the gateway through its aggregate endpoint:
+
+```bash
+for p in 8080 8082 8083 8084; do curl -s "localhost:$p/health" | jq -c; done
+curl -s localhost:8081/gateway/health | jq '{monolith_status, auth_service_status,
+  project_service_status, task_service_status}'
+```
+
+Two traps in that last one. **There is no `/health` on the gateway** — only
+`/gateway/health` (`gateway/main.go:32`). A request to `localhost:8081/health` falls through
+`r.NoRoute(proxy.SmartProxy())` and gets answered by the *monolith*, so it returns a cheerful
+200 that says nothing about the gateway. And `/gateway/health` returns HTTP 200 even when every
+dependency is unreachable, while `gateway_status` is a hardcoded literal
+(`gateway/internal/proxy/proxy.go:225-245`). Assert on the four `*_status` strings; ignore the
+status code and ignore `gateway_status`.
+
+Then run the existing API suite, which is a far better baseline than curling by hand:
+
+```bash
+npx newman run ~/Downloads/postman_testing_suite_exports/"Task Management Microservices API.postman_collection.json"
+```
+
+`gateway_url` defaults to `http://localhost:8081` inside the collection, so this needs no
+configuration.
+
+**Baseline measured 2026-09-04.** On a *fresh* database: 17 requests, 0 request failures,
+15 assertions, 1 failure — and it was a real pre-existing bug, not an environment artifact.
+
+`Filter Tasks by Status` failed with `TypeError: Cannot read properties of null (reading
+'forEach')`, because `var taskList []gin.H` is a nil slice and Go marshals nil slices to JSON
+`null` rather than `[]`. A filter matching zero rows returned `{"tasks": null}`, so any client
+iterating the array threw. The same bug was in four list handlers across three services.
+**Fixed in commit `b7742d0`** with `make([]gin.H, 0, len(tasks))`; verified by hand —
+`GET /tasks?status=Blocked` now returns `{"tasks": []}`.
+
+**The suite is not idempotent, and this matters for every later stage.** Re-running it against
+the same database yields **three** failures, none caused by the fix above:
+
+1. `Register User` — 409, because it posts a hardcoded `microservices@test.com` that now
+   exists. Does not cascade; `Login User` runs next and re-sets `auth_token`.
+2. `Update Project` — 409, because it renames to a hardcoded `Updated Microservices Project`
+   that already exists from the previous run.
+3. `Filter Tasks by Status` — now a clean `expected 'Done' to deeply equal 'In Progress'`
+   rather than a crash. The test is internally inconsistent: it queries `?status=Done` and
+   then asserts the returned tasks are `In Progress`. The endpoint is correct; the test is
+   wrong.
+
+That third one turning from a `TypeError` into a value comparison is the proof the fix landed —
+the response is now an array.
+
+**So the standing rule while working through Stages 1–8:** either run the suite after a
+`docker compose down -v` for a clean comparison, or run it as-is and expect exactly these
+three. A *fourth* failure is a regression; these three are not. Stage 9 should make the
+collection idempotent so this caveat stops being necessary.
+
+Finally, record the state you are leaving behind:
+
+```bash
+cd task-service && go test ./...   # expect: "no test files"
+```
+
+That is here on purpose. Seeing `no test files` for every package once makes the first real
+test in Stage 2 unmistakably the first.
+
+- [ ] Six containers up; any restart explained rather than shrugged at
+- [ ] All four direct `/health` endpoints report their service name and `healthy`
+- [ ] `/gateway/health` shows all four `*_status` fields `healthy`
+- [ ] Newman run saved, with the one expected `Register User` failure identified by name
+- [ ] Task creation returns 201 through the gateway
+- [ ] Confirmed no notification fires
+- [ ] `go test ./...` runs clean and reports no test files
+
+---
+
+### Stage 1 — Kafka broker in Compose
+
+Add to `docker-compose.yml` only. No Go code, and therefore **no test** — see "what is
+deliberately not unit tested" above. Verification is the shell below.
+
+```yaml
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: task-mgmt-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - microservices
+```
+
+Follow the file's existing conventions: `container_name: task-mgmt-*`, the `microservices`
+network, a healthcheck like `postgres` has.
+
+Verify by hand before writing any producer:
+
+```bash
+docker compose up -d kafka
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --create \
+  --topic task-events --bootstrap-server localhost:9092 --partitions 3
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --list \
+  --bootstrap-server localhost:9092
+```
+
+- [ ] Broker reaches healthy
+- [ ] `task-events` topic created with 3 partitions
+- [ ] Commit: `feat: add Kafka broker in KRaft mode`
+
+**Leave `KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"` on** for local convenience, but know it is
+a thing you would disable in production — a good small interview answer.
+
+---
+
+### Stage 2 — The event contract, test-first
+
+The repo's first real test. No Kafka, no DB, no handlers — just the envelope and its JSON.
+Starting here is the whole reason this plan was restructured: the wire contract is the thing
+two services will agree on, so it gets pinned down before either of them exists.
+
+**RED.** Write `task-service/internal/events/event_test.go` first, against types that are not
+written yet. It will not compile, and that is the correct first failure. Assert:
+
+- Marshaling an envelope produces exactly the JSON keys from section 3 —
+  `event_id`, `event_type`, `occurred_at`, `task_id`, `actor_id`, `task`, `changes`. Unmarshal
+  into a `map[string]any` and check the key set, rather than comparing a string; that survives
+  field reordering but still fails on a rename.
+- `occurred_at` round-trips as RFC 3339.
+- `changes` is **absent** (not `null`, not `[]`) when there are none — i.e. the field carries
+  `omitempty`. A `task.created` event should not ship an empty diff.
+- A `ChangeDetail` marshals with the field names the monolith's `services.ChangeDetail` uses,
+  so Stage 6 can port `email.go` without touching its signatures.
+- `NewTaskCreated(task, actorID)` sets `event_type` to `task.created`, copies `task.ID` into
+  `task_id`, and generates a non-empty, distinct `event_id` on two successive calls.
+
+Run it: `cd task-service && go test ./internal/events/`. Confirm it fails to build.
+
+**GREEN.** Write `internal/events/event.go`: the envelope structs, `ChangeDetail`, and the
+`NewTaskCreated` constructor. Nothing else — no Kafka import in this package at all. Keeping
+the contract package I/O-free is what keeps its tests instant.
+
+Dependency for `event_id`:
+
+```bash
+cd task-service && go get github.com/google/uuid && go mod tidy
+```
+
+- [ ] Test written first and observed failing to compile
+- [ ] `go test ./internal/events/` passes
+- [ ] `internal/events` imports no Kafka and no gorm — check the import block
+- [ ] Commit: `feat: add task event contract with tests`
+
+---
+
+### Stage 3 — The publisher behind an interface, test-first
+
+**RED.** Write `internal/events/publisher_test.go` before the publisher. Define the seam the
+test needs:
+
+```go
+type messageWriter interface {
+    WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+}
+```
+
+`*kafka.Writer` satisfies this already, so production passes the real one and the test passes
+a fake that appends to a slice and can be told to return an error. Assert:
+
+- Publishing a created event calls the writer exactly once.
+- The message **key** is the task ID as a string — this is the ordering guarantee from
+  section 3, and it is the single most important assertion in this stage. Get it wrong and
+  events for one task scatter across partitions, which no amount of manual clicking would
+  reveal.
+- The message value unmarshals back into an equal envelope.
+- A writer error is **returned** from `Publish`, not logged and swallowed. The decision to
+  ignore it belongs to the caller in Stage 4, not to this layer.
+
+**GREEN.** Write `internal/events/publisher.go`: a `Publisher` struct over `messageWriter`,
+`PublishTaskCreated(ctx, task, actorID) error`, and `Close()`. Read `KAFKA_BROKERS` and
+`KAFKA_TOPIC` from env at construction, not at publish time.
+
+```bash
+cd task-service && go get github.com/segmentio/kafka-go && go mod tidy
+```
+
+- [ ] Test written first and observed failing
+- [ ] Key-is-task-ID assertion present and passing
+- [ ] Writer errors propagate rather than being logged
+- [ ] Commit: `feat: kafka publisher with fake-writer tests`
+
+---
+
+### Stage 4 — Wire the publisher into the create handler, test-first
+
+This is the stage that replaces the TODO at `handlers.go:112`.
+
+**RED.** Write the handler test first. This one needs the DB, so it is the Layer-2 sqlmock
+setup from section 4. Define a `Publisher` interface in the handlers package (consumer-side
+interface, so handlers depend on what they use) and inject a fake. Assert:
+
+- A successful create publishes exactly one `task.created` carrying the ID the DB assigned —
+  which proves the publish happens **after** the insert, since the ID does not exist before it.
+- **A publish failure still returns 201.** Make the fake return an error and assert the status
+  code. This is the decoupling guarantee as an executable claim: the task is already
+  committed, so a 500 would tell the client something false.
+- A failed DB insert returns 500 and publishes **nothing**.
+
+That middle assertion is the one to write with care. It is the design of the whole system
+reduced to one test, and it is exactly the property a future refactor would break by
+"improving" error handling.
+
+**GREEN.** Add the publisher field to the handler, construct it once in `task-service/main.go`
+with `defer publisher.Close()`, and publish after the `database.DB.Create(&task)` error check.
+Log publish failures; return 201 regardless.
+
+**Then the integration test**, in a new `//go:build integration` file: with the Compose stack
+up, create a task through the handler and read the event back off the real broker with a
+`kafka.Reader`. This is the first end-to-end proof, and it is tagged so it never slows the
+unit loop.
+
+Manual confirmation with the console consumer is still worth doing once:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic task-events --bootstrap-server localhost:9092 --from-beginning
+```
+
+- [ ] Handler tests written first and observed failing
+- [ ] "Publish failure still returns 201" test passes
+- [ ] `go test -tags=integration ./...` reads the event off a real broker
+- [ ] `go test ./...` still passes with Docker stopped
+- [ ] TODO at `handlers.go:112` deleted
+- [ ] Commit: `feat: publish task.created from task-service`
+
+---
+
+### Stage 5 — notification-service consumer, test-first (log only, no email)
+
+New top-level directory `notification-service/`, structured like the existing services:
+`main.go`, `Dockerfile` (copy `task-service/Dockerfile`, no port to expose), `go.mod` with
+module name `task-management-notification-service`. Copy `internal/events/event.go` from
+`task-service` — separate modules, so this is a duplicated contract, which is the standard
+trade in a polyrepo-style layout. Note it in the file header.
+
+This stage only reads events and logs them. Consumer-group mechanics are easier to get right
+without SMTP in the way.
+
+**RED.** The testable part is not the reader loop — it is the per-message decision. Write
+`internal/consumer/handler_test.go` first, against a pure
+`handleEvent(ctx, envelope) error`, table-driven:
+
+- A `task.created` envelope is handled and reports which action it took.
+- An **unknown `event_type` is skipped, not an error.** Forward compatibility: a future
+  producer adding `task.archived` must not crash or stall this consumer.
+- **Malformed JSON returns an error without panicking.** The loop must survive a bad message;
+  write that as a test rather than trusting it.
+- An envelope with `actor_id` of 0 is rejected, since there is no one to notify.
+
+**GREEN.** Write `handleEvent`, then the loop around it: `kafka.NewReader` with
+`GroupID: "notification-service"` — a group ID, not a bare partition reader, so offsets are
+tracked and the service resumes where it left off. Log with the `[NOTIFICATION-SERVICE]`
+prefix, matching `task-service/main.go`'s `gin.LoggerWithFormatter` style. Handle `SIGTERM`
+and close the reader cleanly so offsets commit on shutdown.
+
+Add to Compose with `depends_on: kafka: condition: service_healthy` and the same
+`DATABASE_URL`/`microservices` network as the others.
+
+**Manual verification — the part no test covers.** Create three tasks, watch three log lines.
+Then `docker compose restart notification-service` and create another: it should pick up only
+the new event, not replay all four.
+
+- [ ] `handleEvent` tests written first and observed failing
+- [ ] Unknown-event-type and malformed-JSON cases pass
+- [ ] Events logged as they arrive
+- [ ] Restart does not replay already-consumed events
+- [ ] `docker compose stop notification-service`, create 2 tasks, start it again — both
+      arrive. **This is the payoff of the whole design; see it work.**
+- [ ] Commit: `feat: notification-service consumer group with handler tests`
+
+---
+
+### Stage 6 — Real emails, test-first
+
+Port `monolith/internal/services/email.go` into
+`notification-service/internal/services/email.go`.
+
+- Copy it, do not import it. The monolith is a separate Go module
+  (`github.com/P4rz1val22/task-management-api`) and is the old side of the Strangler Fig —
+  reaching into it would recouple what this work is decoupling.
+- `SendTaskCreatedNotification(task, userEmail)` and
+  `SendTaskUpdatedNotification(task, userEmail, changes)` keep their exact signatures, which
+  is why the event envelope was shaped to match.
+
+**RED, and this is the interesting bit:** `email.go` has never had a test in its life. Port it
+first, then write the tests against the ported copy before changing a line of it — the tests
+are what let you refactor it afterward. To make it testable, extract the actual SMTP call
+behind a one-method interface:
+
+```go
+type mailSender interface {
+    Send(to []string, msg []byte) error
+}
+```
+
+Then assert, with a fake sender:
+
+- The rendered body of an update email contains every changed field and **no unchanged
+  field**. Table-driven over a few change sets. This is the behavior a user would notice
+  breaking, and it is pure string rendering — ideal for a test.
+- With `SMTP_USERNAME`/`SMTP_PASSWORD` unset, nothing is sent and the "SMTP not configured -
+  would send" path is taken. The monolith's graceful degradation becomes a guarantee instead
+  of an accident.
+- Recipient lookup: given an `actor_id`, the email goes to that user's address. This is the
+  `database.DB.First(&user, userID)` from the monolith's goroutine, now keyed off the event —
+  sqlmock again.
+
+**GREEN.** Wire `handleEvent` to call the email service. Put `SMTP_USERNAME`/`SMTP_PASSWORD`
+in Compose for this service.
+
+- [ ] Ported `email.go` has tests before any modification
+- [ ] Change-rendering test covers "unchanged fields absent"
+- [ ] Task creation produces a "would send" log with SMTP unset
+- [ ] With real credentials, an email actually arrives
+- [ ] Commit: `feat: send task notifications from notification-service`
+
+---
+
+### Stage 7 — `task.updated` and `task.deleted`, test-first
+
+The best TDD fit in the plan, because the diffing logic is pure and the rules are fiddly.
+
+**RED.** Write the diff test before the diff. Extract it as
+`events.DiffTask(before, after models.Task) []ChangeDetail` — a free function over two
+structs, no gorm, no gin. Table-driven:
+
+- One field changed → exactly one `ChangeDetail`, with the right `from` and `to`.
+- Several fields changed → one entry each, and assert the **order is stable**, or the test
+  will flake once someone iterates a map.
+- **Nothing changed → an empty slice.** This is the "a save that changed nothing sends no
+  email" rule, and having it as a test is the whole argument for this stage's ordering.
+- A `nil` → set `DueDate` (it is a `*time.Time`) renders sensibly rather than printing a
+  pointer address. Easy to get wrong, invisible until it reaches an inbox.
+
+Then a handler test: an update that changes nothing publishes **zero** events.
+
+**GREEN.** Uncomment the `originalTitle`/`originalStatus`/`originalPriority`/`originalEstimate`
+capture at `handlers.go:322`, call `DiffTask`, publish `task.updated` where the TODO at
+`handlers.go:342` sits, and `task.deleted` in `DeleteTask` after `database.DB.Delete(&task)`.
+Skip publishing when `changes` is empty. Branch on `event_type` in the consumer;
+`task.deleted` has no existing email template — either add a small one or skip sending, and
+write down which in this file.
+
+- [ ] `DiffTask` tests written first and observed failing
+- [ ] No-op-update-publishes-nothing test passes
+- [ ] All three TODO comments now deleted from `handlers.go`
+- [ ] An update email lists exactly the fields that changed
+- [ ] Commit: `feat: publish task.updated and task.deleted events`
+
+---
+
+### Stage 8 — Resilience, test-first (optional, and the interview material)
+
+Each of these is a behavior you can only really demonstrate with a test, because the failure
+it prevents is hard to trigger by hand. In rough order of value per hour:
+
+1. **Idempotent consumption.** RED: handling the same `event_id` twice sends exactly one
+   email. That single assertion is the entire feature. GREEN: a `processed_events` table
+   keyed on `event_id`, checked before sending. Closes the duplicate-email hole that
+   at-least-once delivery creates — and note that you cannot show this by clicking around,
+   which is precisely why it gets a test.
+2. **Retry with a dead-letter topic.** RED: a sender that fails N times is retried N times
+   and then produces one message on `task-events.dlq`, with the offset committed. Assert the
+   offset commit — that is what stops one bad event from blocking the partition forever.
+   Head-of-line blocking is a real Kafka failure mode and worth being able to talk about.
+3. **Transactional outbox.** The honest remaining gap: Stage 4 commits to Postgres and *then*
+   publishes, so a crash in between loses the event. The fix is writing the event to an
+   `outbox` table inside the same transaction as the task, with a separate poller publishing
+   from it. RED here is a test that the event row and the task row commit or roll back
+   together. This is the strongest thing on the plan to be able to explain, and also the most
+   work. Consider stopping after 1 and 2 and simply *knowing* this is the gap — being able to
+   name your own architecture's weakness is worth nearly as much as having closed it.
+
+---
+
+### Stage 9 — Docs and close the loop
+
+By this point every Go test is already written, so what is left is the API-level suite and
+the docs — which is the point of the restructure.
+
+- **Get the Postman collection into git.** Take a **fresh** export of
+  `Task Management Microservices API` from the app and commit it to `docs/postman/`, alongside
+  the monolith collection. Do not reuse the August 2025 export sitting in `~/Downloads` — the
+  live collection is the cloud copy (see section 4) and that file is a stale snapshot. Diff
+  the fresh export against the old one first; whatever shows up is drift you accumulated
+  without noticing, which is the argument for keeping it in git at all. Commit the export
+  before adding to it, so the diff of the addition is reviewable rather than buried in a
+  23KB blob.
+- **Optional, but it is what makes the habit stick:** fetch the collection via the Postman
+  API (`GET https://api.getpostman.com/collections/{id}` with an `X-Api-Key` header) from a
+  small script, so re-exporting is a command rather than a five-click manual chore. Needs an
+  API key from Postman account settings. A habit that depends on remembering File → Export
+  is a habit that stops after twice.
+- **Then add to it**, matching the existing style — a real `pm.test()` with body assertions,
+  not a status-code check, and reuse the `auth_token` / `task_id` collection variables rather
+  than introducing new ones. The test to add: task creation still returns 201 with Kafka
+  stopped. That encodes the decoupling guarantee at the HTTP layer, complementing the Go unit
+  test from Stage 4 — the Go test proves the handler ignores the publish error, and this
+  proves the whole stack does.
+- Optionally, close one of the gaps section 4 names while you are in there: add tests to the
+  three direct service-health requests that have none. Cheap, and it stops "17 requests, 15
+  tests" from being a number you have to explain.
+- **Make the collection idempotent**, which Stage 0 proved it isn't. `Register User` and
+  `Update Project` both post hardcoded values that collide on a second run, and
+  `Filter Tasks by Status` asserts `In Progress` while querying `?status=Done`. Randomize the
+  email and project name (a pre-request script, or `{{$randomEmail}}`) and fix that assertion
+  to match its own query. Until this is done, a re-run costs three false failures, which is
+  exactly how a suite stops being trusted.
+- **README** — update the architecture section and diagram to show the broker and the
+  consumer. Add a "Running the tests" section documenting the two-tier split (`make test` for
+  unit, `make test-integration` for the tagged ones) — an undocumented build tag is an
+  invisible test suite.
+- Record the final counts (services, event types, test count from `go test ./... -v`) — they
+  go in the Knowledge Bank.
+
+---
+
+## 6. Things to deliberately not do
+
+- Do not put Kafka publishing in the monolith. It is the old side of the migration; leave it.
+- Do not have `notification-service` call `task-service` over HTTP for task data. The event
+  is self-contained on purpose.
+- Do not add Schema Registry / Avro / Protobuf. JSON is right at this scale and adds a
+  container plus a codegen step for no benefit here.
+- Do not add Kubernetes in the same pass. Compose is the right tool for a local 7-container
+  stack, and mixing two infra changes makes both harder to verify.
+- Do not switch to `confluent-kafka-go`. See section 2.
+- Do not write a test that mocks a Kafka broker wholesale and asserts the mock was called.
+  Fake the narrow interface you own (`messageWriter`, `mailSender`); use a real broker behind
+  the `integration` tag for anything else.
+- Do not let integration tests run under a bare `go test ./...`. The build tag is what keeps
+  the fast loop fast, and a suite that needs Docker to pass is a suite people stop running.
+- Do not add a testing framework. `testing` plus table-driven subtests is enough, and it
+  matches a stdlib-leaning repo. If assertions get painful later, `testify` is a small step,
+  but do not start there.
+
+---
+
+## 7. After the code: close the loop
+
+1. **Log it to the Knowledge Bank** via the `resume-knowledge-bank` skill — confirmed tier,
+   solo work, with the real numbers from Stage 9. Include the honest framing this repo
+   already carries: self-directed portfolio work, not production traffic. On testing, the
+   accurate claim is *extended* coverage, not *introduced* it — the project already had a
+   17-request Postman suite at the API boundary, and this work adds Go unit coverage below
+   that boundary where the event logic lives. That distinction is worth getting right,
+   because "added tests to an untested project" is the kind of line an interviewer can
+   puncture in one question.
+2. **Re-tailor the Chewy resume** (`~/resumes/data/chewy_autoship_swe.js`). The Task
+   Management Microservices project entry gets rewritten around the event system, which
+   converts Kafka, event-driven architecture, and "loosely coupled components" from gaps
+   into evidence.
+3. The line worth landing, once it is true: *replaced in-process goroutine notifications
+   with a durable Kafka consumer group, so task writes no longer depend on mail delivery.*
+   That is a design decision with a reason, which reads better than a tool list.
