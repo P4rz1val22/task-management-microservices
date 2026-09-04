@@ -3,11 +3,13 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 
@@ -23,6 +25,21 @@ import (
 const (
 	DefaultBrokers = "localhost:9092"
 	DefaultTopic   = "task-events"
+)
+
+// Retry policy for a single publish.
+//
+// This exists for one specific, reproducible failure. With topic auto-creation
+// on, the very first write against a fresh broker sends a metadata request that
+// triggers the creation and is then answered with UnknownTopicOrPartition,
+// because the topic does not exist yet at the moment the broker builds the
+// response. kafka-go raises that from Writer.partitions, upstream of its own
+// produce-path retries, so it reaches the caller unretried. The topic does get
+// created, which is why a second attempt a moment later succeeds -- and why
+// without this loop exactly one event is lost per fresh environment, quietly.
+const (
+	maxPublishAttempts = 3
+	publishRetryDelay  = 100 * time.Millisecond
 )
 
 // messageWriter is the seam this package is tested through. *kafka.Writer
@@ -74,9 +91,16 @@ func NewPublisher() *Publisher {
 			Async: false,
 
 			// The topic is auto-created by the broker with
-			// KAFKA_NUM_PARTITIONS: 3, so a first publish against a fresh
-			// stack succeeds instead of failing on an unknown topic.
+			// KAFKA_NUM_PARTITIONS: 3. Note that this alone is not enough for
+			// the first write to land -- see the retry constants above.
 			AllowAutoTopicCreation: true,
+
+			// kafka-go holds a synchronous write open for BatchTimeout waiting
+			// for more messages to batch with, and defaults that to one full
+			// second. This service publishes one message per request, so that
+			// default is paid in full on every create. 10ms keeps the batching
+			// machinery intact while making the wait invisible.
+			BatchTimeout: 10 * time.Millisecond,
 		},
 	}
 }
@@ -122,10 +146,36 @@ func (p *Publisher) publish(ctx context.Context, env Envelope) error {
 		Value: value,
 	}
 
-	if err := p.writer.WriteMessages(ctx, msg); err != nil {
-		return fmt.Errorf("publish %s event for task %d: %w", env.EventType, env.TaskID, err)
+	for attempt := 0; attempt < maxPublishAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("publish %s event for task %d: %w",
+					env.EventType, env.TaskID, ctx.Err())
+			case <-time.After(publishRetryDelay):
+			}
+		}
+
+		if err = p.writer.WriteMessages(ctx, msg); err == nil {
+			return nil
+		}
+		if !isRetryable(err) {
+			break
+		}
 	}
-	return nil
+
+	return fmt.Errorf("publish %s event for task %d: %w", env.EventType, env.TaskID, err)
+}
+
+// isRetryable reports whether another attempt could plausibly succeed. kafka-go
+// classifies its protocol errors itself, and a permanent one (a malformed
+// message, say) only wastes the caller's deadline on retries that cannot work.
+func isRetryable(err error) bool {
+	var kerr kafka.Error
+	if errors.As(err, &kerr) {
+		return kerr.Temporary()
+	}
+	return false
 }
 
 // Close releases the underlying writer. It is a no-op for a writer that does

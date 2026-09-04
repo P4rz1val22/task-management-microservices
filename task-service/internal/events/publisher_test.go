@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -18,13 +19,25 @@ type fakeWriter struct {
 	sent   []kafka.Message
 	err    error
 	closed bool
+
+	// errSeq returns a different error per attempt, so a test can model a
+	// broker that fails once and then succeeds. Entries beyond its length fall
+	// through to err.
+	errSeq []error
 }
 
 func (f *fakeWriter) WriteMessages(ctx context.Context, msgs ...kafka.Message) error {
+	attempt := f.calls
 	f.calls++
-	if f.err != nil {
+
+	if attempt < len(f.errSeq) {
+		if err := f.errSeq[attempt]; err != nil {
+			return err
+		}
+	} else if f.err != nil {
 		return f.err
 	}
+
 	f.sent = append(f.sent, msgs...)
 	return nil
 }
@@ -253,5 +266,86 @@ func TestWriterIsSynchronous(t *testing.T) {
 	w := p.writer.(*kafka.Writer)
 	if w.Async {
 		t.Error("writer is async; publish errors would never reach the caller")
+	}
+}
+
+// A fresh broker with auto-creation on answers the very first metadata request
+// with UnknownTopicOrPartition: the request triggers the creation, but the topic
+// is not ready in time to be described in the same response. kafka-go surfaces
+// that from Writer.partitions before its own produce-path retries apply, so
+// without a retry here the first task created against a clean stack always
+// loses its event -- and only its event, silently, once per environment. Found
+// by running the real stack; a fake writer cannot produce this on its own.
+func TestPublishRetriesUnknownTopic(t *testing.T) {
+	f := &fakeWriter{errSeq: []error{kafka.UnknownTopicOrPartition}}
+	p := newTestPublisher(f)
+
+	if err := p.PublishTaskCreated(context.Background(), sampleTask(), 7); err != nil {
+		t.Fatalf("PublishTaskCreated: %v", err)
+	}
+	if f.calls != 2 {
+		t.Errorf("writer called %d times, want 2 (one failure, one retry)", f.calls)
+	}
+	if len(f.sent) != 1 {
+		t.Errorf("wrote %d messages, want exactly 1 -- a retry must not duplicate", len(f.sent))
+	}
+}
+
+// Retrying a permanent error just delays the inevitable and holds the request
+// open while it does.
+func TestPublishDoesNotRetryPermanentErrors(t *testing.T) {
+	f := &fakeWriter{err: errors.New("malformed message")}
+	p := newTestPublisher(f)
+
+	if err := p.PublishTaskCreated(context.Background(), sampleTask(), 7); err == nil {
+		t.Fatal("expected an error")
+	}
+	if f.calls != 1 {
+		t.Errorf("writer called %d times for a permanent error, want 1", f.calls)
+	}
+}
+
+func TestPublishGivesUpAfterMaxAttempts(t *testing.T) {
+	f := &fakeWriter{err: kafka.UnknownTopicOrPartition}
+	p := newTestPublisher(f)
+
+	if err := p.PublishTaskCreated(context.Background(), sampleTask(), 7); err == nil {
+		t.Fatal("expected an error after exhausting retries")
+	}
+	if f.calls != maxPublishAttempts {
+		t.Errorf("writer called %d times, want maxPublishAttempts = %d", f.calls, maxPublishAttempts)
+	}
+}
+
+// The retry loop must not outlive the caller's deadline.
+func TestPublishRetryStopsOnContextExpiry(t *testing.T) {
+	f := &fakeWriter{err: kafka.UnknownTopicOrPartition}
+	p := newTestPublisher(f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	if err := p.PublishTaskCreated(ctx, sampleTask(), 7); err == nil {
+		t.Fatal("expected an error")
+	}
+	if f.calls >= maxPublishAttempts {
+		t.Errorf("writer called %d times despite an expiring context; the backoff must respect it", f.calls)
+	}
+}
+
+// kafka-go batches synchronous writes and waits BatchTimeout for the batch to
+// fill before flushing. That default is a full second, which this service pays
+// on every single create because it writes one message at a time. Caught only by
+// timing a real request; the fake returns instantly no matter what.
+func TestWriterBatchTimeoutIsShort(t *testing.T) {
+	p := NewPublisher()
+	defer p.Close()
+
+	w := p.writer.(*kafka.Writer)
+	if w.BatchTimeout <= 0 {
+		t.Fatal("BatchTimeout unset; kafka-go defaults it to 1s and every create would pay it")
+	}
+	if w.BatchTimeout > 50*time.Millisecond {
+		t.Errorf("BatchTimeout = %v, want <= 50ms so a single-message write flushes promptly", w.BatchTimeout)
 	}
 }

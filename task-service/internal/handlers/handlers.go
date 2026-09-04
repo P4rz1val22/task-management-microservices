@@ -1,12 +1,49 @@
 package handlers
 
 import (
-	"github.com/gin-gonic/gin"
+	"context"
+	"log"
 	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
 	"task-management-task-service/internal/database"
 	"task-management-task-service/internal/models"
-	"time"
 )
+
+// eventPublisher is what this package needs from internal/events. It is declared
+// here, by the consumer, rather than exported from events -- which keeps the
+// Kafka client out of the handler tests entirely and lets a test install a fake
+// that records calls.
+type eventPublisher interface {
+	PublishTaskCreated(ctx context.Context, task models.Task, actorID uint) error
+}
+
+// publishTimeout bounds how long a write may wait on the broker before giving up
+// and answering the caller anyway.
+//
+// Two seconds is a deliberate trade. Publishing synchronously means a 201 really
+// does imply the event reached Kafka, which is what makes the notification
+// pipeline trustworthy on the happy path. The cost is that when the broker is
+// down, every create pays this much latency before returning its (still
+// successful) 201. Shorter would give up on a broker that is merely mid-restart;
+// longer would make an outage feel like a hang.
+const publishTimeout = 2 * time.Second
+
+// Publisher is assigned by main.go at startup, mirroring how database.DB works
+// in this service. The no-op default means an unwired binary logs instead of
+// panicking on a nil interface.
+var Publisher eventPublisher = noopPublisher{}
+
+// noopPublisher is the default: it drops events and says so, which is the right
+// behaviour for a binary that was never given a real publisher.
+type noopPublisher struct{}
+
+func (noopPublisher) PublishTaskCreated(_ context.Context, task models.Task, _ uint) error {
+	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.created for task %d", task.ID)
+	return nil
+}
 
 type TaskRequest struct {
 	Title       string `json:"title" binding:"required"`
@@ -109,8 +146,23 @@ func CreateTask(c *gin.Context) {
 		return
 	}
 
-	// TODO: Send notification to Notification Service (future microservice)
-	// For now, we skip the email notification
+	// Publish task.created. This replaces the notification placeholder left behind when
+	// the task code was extracted from the monolith, and it is deliberately the
+	// last thing that happens before the response.
+	//
+	// The context is derived from Background, not from the request: the task is
+	// committed, so a client that has hung up must not cancel an event for a task
+	// that genuinely exists.
+	publishCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
+	defer cancel()
+	if err := Publisher.PublishTaskCreated(publishCtx, task, userID); err != nil {
+		// Logged, never fatal. The task is committed and the caller gets its 201;
+		// a lost notification is by far the lesser failure, and taking the write
+		// path down for a mail side effect is exactly what this migration exists
+		// to stop. The event is genuinely lost here -- a transactional outbox is
+		// what would make it recoverable rather than merely survivable.
+		log.Printf("[TASK-SERVICE] publish task.created for task %d: %v", task.ID, err)
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Task created successfully",

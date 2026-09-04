@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"task-management-task-service/internal/database"
+	"task-management-task-service/internal/events"
 	"task-management-task-service/internal/handlers"
 	"task-management-task-service/internal/middleware"
 
@@ -13,6 +14,14 @@ import (
 func main() {
 	// Connect to database
 	database.Connect()
+
+	// Wire the Kafka publisher, mirroring how database.Connect installs
+	// database.DB. Reading KAFKA_BROKERS/KAFKA_TOPIC happens here, once, inside
+	// NewPublisher -- the writer itself connects lazily on the first publish, so
+	// task-service starts fine with the broker down.
+	publisher := events.NewPublisher()
+	defer publisher.Close()
+	handlers.Publisher = publisher
 
 	// Set Gin mode
 	gin.SetMode(gin.ReleaseMode)

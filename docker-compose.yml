@@ -104,6 +104,9 @@ services:
       - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
       - JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
       - GIN_MODE=release
+      # Containers use the INTERNAL listener; localhost:9092 is host-only.
+      - KAFKA_BROKERS=kafka:29092
+      - KAFKA_TOPIC=task-events
     ports:
       - "8084:8084"
     healthcheck:
@@ -115,6 +118,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        # service_started, deliberately NOT service_healthy. Waiting for a
+        # healthy broker would rebuild at boot exactly the coupling this design
+        # exists to remove, and would push the gateway's startup out behind
+        # Kafka's as well. The writer connects lazily on first publish, so the
+        # service does not need the broker to come up. The cost is that a create
+        # landing in the cold-boot window loses its event -- the same gap a
+        # transactional outbox would close.
+        condition: service_started
     restart: unless-stopped
     networks:
       - microservices

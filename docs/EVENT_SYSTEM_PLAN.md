@@ -595,12 +595,70 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --topic task-events --bootstrap-server localhost:9092 --from-beginning
 ```
 
-- [ ] Handler tests written first and observed failing
-- [ ] "Publish failure still returns 201" test passes
-- [ ] `go test -tags=integration ./...` reads the event off a real broker
-- [ ] `go test ./...` still passes with Docker stopped
-- [ ] TODO at `handlers.go:112` deleted
-- [ ] Commit: `feat: publish task.created from task-service`
+- [x] Handler tests written first and observed failing on `undefined: Publisher`
+- [x] "Publish failure still returns 201" test passes
+- [x] `go test -tags=integration ./...` reads the event off a real broker
+- [x] `go test ./...` still passes with Docker stopped
+- [x] TODO at `handlers.go:112` deleted
+- [x] Commit: `feat: publish task.created from task-service`
+
+**Decisions taken.** Publishing is synchronous and capped at 2s
+(`handlers.publishTimeout`), on a context derived from `Background` rather than
+the request, so a client that hangs up cannot cancel an event for a task that was
+genuinely committed. The publisher hangs off an exported package-level
+`handlers.Publisher`, mirroring `database.DB`, because this service has no
+dependency injection anywhere and introducing it for one field would have buried a
+ten-line change in a two-hundred-line diff. The `eventPublisher` interface is
+declared in `handlers`, by the consumer, which keeps `kafka-go` out of the handler
+tests entirely.
+
+**Two defects that only the real stack could surface.** Both were invisible to the
+fake-writer tests by construction, and both are now covered by config assertions
+and `//go:build integration` tests:
+
+1. **The first publish against a fresh broker always failed**, losing exactly one
+   event per environment, silently. With auto-creation on, `Writer.partitions`
+   (kafka-go `writer.go:744`) sends a metadata request that *triggers* the
+   creation and is then answered with `UnknownTopicOrPartition`, because the topic
+   does not exist yet when the broker builds that response. That error is raised
+   upstream of kafka-go's own produce-path retries, so it reached the caller
+   unretried. Fixed with a bounded retry in `publish` that only retries errors
+   kafka-go itself classifies as temporary; `TestFirstPublishToNewTopicSucceeds`
+   covers it against a genuinely new topic.
+2. **Every create paid a full second of latency.** kafka-go holds a synchronous
+   write open for `BatchTimeout` waiting to batch, and defaults that to 1s — which
+   a service publishing one message per request pays in full, every time. Setting
+   it to 10ms took creates from ~1000ms to ~16ms. `TestWriterBatchTimeoutIsShort`
+   pins it.
+
+Both belong to the same family as the Stage 3 balancer bug: a test against a fake
+can only prove the code is right *given* the real client behaves like the fake, so
+anything the client decides for you by default needs its own assertion.
+
+**Measured end to end**, against a stack rebuilt from `docker compose down -v`:
+
+| Scenario | Result |
+|---|---|
+| First create, broker has never seen the topic | 201 in 154ms, event published |
+| Subsequent creates | 201 in ~16ms |
+| Create with `kafka` stopped | 201 in 27–320ms, body unchanged, error logged, task persisted |
+| Create after `kafka` restarted | 201 in 42ms, publishing resumes with no intervention |
+
+Events for different tasks hash across partitions; `TestSameTaskAlwaysSamePartition`
+proves five events for one task all land on one, against a real broker rather than
+against an assertion about the balancer field.
+
+**The known gap, unchanged and deliberate.** Events published while the broker was
+down are gone — two of six tasks in the run above produced no event. Publishing
+happens after the commit with no record of the intent, so nothing can replay them.
+That is what the transactional outbox in Stage 8 would fix, and naming it honestly
+is part of the deliverable.
+
+Compose now passes `KAFKA_BROKERS=kafka:29092` and `KAFKA_TOPIC=task-events` to
+`task-service`, with `depends_on: kafka: condition: service_started` — deliberately
+not `service_healthy`, since waiting on a healthy broker would rebuild at boot
+exactly the coupling this design removes, and would push the gateway's startup out
+behind Kafka's too.
 
 ---
 
