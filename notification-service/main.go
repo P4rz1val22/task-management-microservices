@@ -19,6 +19,7 @@ import (
 
 	"task-management-notification-service/internal/consumer"
 	"task-management-notification-service/internal/database"
+	"task-management-notification-service/internal/dedupe"
 	"task-management-notification-service/internal/services"
 	"task-management-notification-service/internal/users"
 )
@@ -37,6 +38,18 @@ func main() {
 
 	handler := consumer.New()
 
+	// The dead-letter topic is where messages go when they cannot be processed
+	// -- poison ones, and transient failures that outlasted their retries.
+	// Without it the loop has to choose between committing a failed message
+	// (losing it) and not committing (blocking every event behind it).
+	dlq := consumer.NewDeadLetter(cfg)
+	defer func() {
+		if err := dlq.Close(); err != nil {
+			log.Printf("[NOTIFICATION-SERVICE] closing dead-letter writer: %v", err)
+		}
+	}()
+	log.Printf("[NOTIFICATION-SERVICE] dead-letter topic=%q", consumer.DeadLetterTopic(cfg.Topic))
+
 	// Email is wired opportunistically. If Postgres is unreachable at startup
 	// the service still consumes and still reports each event -- it just cannot
 	// resolve an address, so it says so once instead of crash-looping. A
@@ -47,6 +60,17 @@ func main() {
 	} else {
 		handler.Recipients = users.NewDBLookup(db)
 		handler.Mailer = services.NewEmailService()
+
+		// Deduplication needs its own table. This service owns it outright --
+		// nothing else reads or writes it -- so migrating here does not join
+		// the four-way AutoMigrate race the other services have.
+		store := dedupe.NewStore(db)
+		if err := store.Migrate(); err != nil {
+			log.Printf("[NOTIFICATION-SERVICE] no dedupe table (%v); "+
+				"a redelivered event will send a second email", err)
+		} else {
+			handler.Processed = store
+		}
 	}
 
 	reader := consumer.NewReader(cfg)
@@ -56,7 +80,7 @@ func main() {
 		}
 	}()
 
-	if err := consumer.Run(ctx, reader, handler); err != nil {
+	if err := consumer.Run(ctx, reader, handler, dlq); err != nil {
 		// Not log.Fatal: that skips the deferred Close and abandons the offset
 		// commit. Log, return, and let the deferred cleanup run.
 		log.Printf("[NOTIFICATION-SERVICE] consumer stopped with error: %v", err)

@@ -972,8 +972,71 @@ it prevents is hard to trigger by hand. In rough order of value per hour:
    `outbox` table inside the same transaction as the task, with a separate poller publishing
    from it. RED here is a test that the event row and the task row commit or roll back
    together. This is the strongest thing on the plan to be able to explain, and also the most
-   work. Consider stopping after 1 and 2 and simply *knowing* this is the gap — being able to
-   name your own architecture's weakness is worth nearly as much as having closed it.
+   work.
+
+   **Split into its own stage, and not skipped.** The original note here suggested stopping
+   after 1 and 2 and simply knowing the gap exists. That was reconsidered: this project's
+   stated justification is decoupling and reasoning about failure, so a write path that can
+   silently drop events is a hole in precisely the dimension the work claims to be about.
+   Its size is a scheduling question, not a reason to drop it — see Stage 8b.
+
+- [x] Idempotent consumption
+- [x] Retry with a dead-letter topic
+- [ ] Transactional outbox — deferred to **Stage 8b**, with its own plan, because it changes
+      the write path and adds a background process (the same profile that made Stage 4 use
+      plan mode)
+
+**Sequencing was a dependency, not just cost order.** Item 1 had to come first because item 3
+needs it: an outbox poller publishes a row and then marks it sent, so a crash between those
+two republishes the event. The outbox *creates* duplicates by design, and is only safe on top
+of an idempotent consumer.
+
+**Deduplication.** `processed_events`, keyed on `event_id` — the field the envelope has
+carried since Stage 2, put there for exactly this. Recorded **after** a successful send, never
+before: recording first would mean a failed send is never retried, because the redelivery
+would be waved through as a duplicate and the notification lost silently. Checked before the
+recipient lookup, so a redelivery costs one query rather than two and an SMTP round trip. A
+store outage is never read as "not seen" — that would send duplicates during exactly the
+moment things are already going wrong — and is classified transient, not poison.
+
+The residual window is irreducible and worth naming: a crash between sending the email and
+recording the row replays that one email. Closing it would need the send and the database
+write to be a single atomic act, and SMTP does not participate in database transactions.
+
+**Dead-letter topic.** `task-events.dlq`, derived from the source topic name rather than
+separately configured, so a typo can never point them at the same topic and loop failures back
+forever. The original key and value travel byte for byte so a message stays replayable;
+diagnostics ride in headers. This is `notification-service`'s first *producer* — until now it
+only read.
+
+The load-bearing assertion is the one the plan singles out: **if the dead-letter write fails,
+the offset is not committed.** Committing a message that was preserved nowhere is the silent
+loss the whole feature exists to prevent.
+
+**A real bug, found by running it, in the most instructive way available.** The first
+dead-letter write failed with `UnknownTopicOrPartition` — the identical topic auto-creation
+race fixed in `task-service` in Stage 4, which was never carried across to this new producer.
+What happened next is the point:
+
+- The safety property **held**. The write failed, so the offset was correctly not committed,
+  and nothing was lost.
+- Liveness did **not**. The poison messages could not reach the one place built to hold them,
+  and partition 0 stalled at lag 2 until the service was restarted.
+
+Fixed with the same bounded retry over kafka-go's temporary errors. On restart both messages
+drained into `task-events.dlq` with full headers and lag returned to zero on all three
+partitions. The general lesson is that a correct safety property can still leave a system
+stuck, and that a fix applied to one producer does not travel to the next one for free.
+
+**Observed end to end:**
+
+| Check | Result |
+|---|---|
+| `processed_events` table | Created with `event_id` as primary key |
+| Create a task | One email, one row recorded |
+| Replay the **identical** event onto the topic | Logged `duplicate`, **no second email**, still one row |
+| Two poison messages, then a real event | Both `DEAD-LETTERED to task-events.dlq`, real event processed, lag 0 |
+| Dead-letter contents | Original key and bytes intact, headers naming the error, source topic, partition, offset and time |
 
 ---
 

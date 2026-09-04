@@ -161,7 +161,36 @@ func processWithRetry(ctx context.Context, process processFunc, value []byte, de
 // The loop deliberately owns no decisions: it fetches, hands the bytes to the
 // handler, logs the outcome and commits. Everything worth testing lives in
 // HandleMessage.
-func Run(ctx context.Context, reader *kafka.Reader, h *Handler) error {
+// resolveMessage decides what happens to a message once the handler is done
+// with it: whether it needs preserving, and whether its offset may be
+// committed.
+//
+// Split out of the loop so the decision is testable without a broker. It is the
+// single place that answers the question the whole dead-letter feature exists
+// for -- is it safe to move past this message?
+func resolveMessage(ctx context.Context, dlq *DeadLetter, msg kafka.Message, handleErr error) (commit bool, err error) {
+	if handleErr == nil {
+		return true, nil
+	}
+
+	// No dead-letter writer configured. Fall back to the pre-Stage-8 behaviour:
+	// commit and rely on the log. Worse than preserving the message, better
+	// than wedging the partition on it forever.
+	if dlq == nil {
+		return true, nil
+	}
+
+	if err := dlq.Send(ctx, msg, handleErr); err != nil {
+		// The message is preserved nowhere. Committing now would lose it for
+		// good, so the offset stays put and the message is redelivered.
+		return false, err
+	}
+
+	// Safely set aside, so moving past it is honest.
+	return true, nil
+}
+
+func Run(ctx context.Context, reader *kafka.Reader, h *Handler, dlq *DeadLetter) error {
 	log.Printf("[NOTIFICATION-SERVICE] consuming topic=%q group=%q",
 		reader.Config().Topic, reader.Config().GroupID)
 
@@ -182,52 +211,35 @@ func Run(ctx context.Context, reader *kafka.Reader, h *Handler) error {
 		}
 
 		res, handleErr := processWithRetry(ctx, h.HandleMessage, msg.Value, processRetryDelay)
-		switch {
-		case handleErr != nil && errors.Is(handleErr, ErrBadMessage):
-			// Poison message. Commit it and move on: leaving it uncommitted
-			// would replay it forever and every event behind it on this
-			// partition would go unprocessed. Stage 8 routes these to a
-			// dead-letter topic instead of only logging them.
-			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d DISCARDED: %v",
-				msg.Partition, msg.Offset, handleErr)
-		case errors.Is(handleErr, context.Canceled):
+
+		if errors.Is(handleErr, context.Canceled) {
 			// Shutting down mid-retry. Return without committing so the message
 			// is redelivered to whoever picks up this partition next.
 			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d deferred, shutting down",
 				msg.Partition, msg.Offset)
 			return nil
+		}
+
+		commit, resolveErr := resolveMessage(ctx, dlq, msg, handleErr)
+		switch {
+		case resolveErr != nil:
+			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d could not be preserved: %v",
+				msg.Partition, msg.Offset, resolveErr)
 		case handleErr != nil:
-			// Transient, and it survived every retry. The offset is still
-			// committed, so this event IS LOST -- said plainly because it is a
-			// real hole, not a shrug.
-			//
-			// Note what this branch does NOT justify. Refusing to commit and
-			// blocking instead would not "lose everything behind it": anything
-			// reaching here failed for a reason unrelated to the message (the
-			// database or the mail server is down), so the events behind it
-			// would fail too and there is no useful work being blocked. A
-			// permanent, message-specific failure takes the ErrBadMessage
-			// branch above and never arrives here.
-			//
-			// Blocking is therefore a legitimate alternative, and with the
-			// current window -- maxProcessAttempts * processRetryDelay, about a
-			// second -- a routine Postgres restart is long enough to drop
-			// in-flight notifications. The reason this stays as it is: Stage 8
-			// replaces the whole branch with a dead-letter publish, which keeps
-			// the event AND keeps the partition moving. Widening the retry
-			// window here would be work that stage deletes.
-			//
-			// The one case blocking genuinely cannot handle, and the reason the
-			// dead-letter topic is the real answer: a failure that looks
-			// transient but is specific to one message -- a mail server
-			// permanently rejecting one malformed address -- would stall this
-			// loop indefinitely, and since the loop is sequential that stalls
-			// every partition this consumer owns, not just one.
-			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d EVENT LOST after %d attempts: %v",
-				msg.Partition, msg.Offset, maxProcessAttempts, handleErr)
+			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d DEAD-LETTERED to %s: %v",
+				msg.Partition, msg.Offset, DeadLetterTopic(reader.Config().Topic), handleErr)
 		default:
 			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d key=%s %s: %s",
 				msg.Partition, msg.Offset, string(msg.Key), res.Action, res.Summary)
+		}
+
+		if !commit {
+			// Nowhere safe to put the message, so its offset stays where it is
+			// and it will be redelivered. This blocks the partition, which is
+			// the correct trade only because the alternative -- committing a
+			// message that was preserved nowhere -- is the silent loss the
+			// dead-letter topic exists to prevent.
+			continue
 		}
 
 		if err := reader.CommitMessages(ctx, msg); err != nil {

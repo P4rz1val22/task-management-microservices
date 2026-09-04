@@ -59,6 +59,13 @@ docker compose exec postgres psql -U postgres -d taskmanagement -c '\dt'
 
 ## Health endpoints — two traps
 
+`notification-service` owns one table, `processed_events`, keyed on `event_id`.
+It is how a redelivered event is recognised and not emailed twice; Kafka is
+at-least-once, so redelivery is normal rather than exceptional. This service
+migrates that table itself, which does **not** join the four-way AutoMigrate
+race below — that race is four services fighting over shared tables, this is one
+service creating its own.
+
 `notification-service` is the exception to everything in this section: it serves
 no HTTP at all, has no port and no healthcheck, so `docker compose ps` shows it
 as plain `Up` rather than `(healthy)`. That is correct, not a fault. To check it
@@ -85,7 +92,19 @@ curl -s localhost:8081/gateway/health | jq '{monolith_status, auth_service_statu
 
 ## Kafka
 
-Topic `task-events`, 3 partitions, keyed by task ID. Two listeners:
+Topic `task-events`, 3 partitions, keyed by task ID, plus `task-events.dlq`
+holding messages `notification-service` could not process. A dead-lettered
+message keeps its original key and value byte for byte so it can be replayed;
+everything diagnostic rides in headers (`dlq-error`, `dlq-topic`,
+`dlq-partition`, `dlq-offset`, `dlq-at`).
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic task-events.dlq --from-beginning --property print.headers=true \
+  --bootstrap-server localhost:9092
+```
+
+Two listeners:
 
 - Containers on the compose network use **`kafka:29092`**
 - Anything on the host (CLI tools, integration tests) uses **`localhost:9092`**
@@ -108,8 +127,8 @@ This rules out `confluent-kafka-go` (use `segmentio/kafka-go`) and
 ## Testing
 
 Go tests live in `task-service/internal/events`, `task-service/internal/handlers`
-`notification-service/internal/consumer`, `.../internal/services` and
-`.../internal/users`. API-level
+`notification-service/internal/consumer`, `.../internal/services`,
+`.../internal/users` and `.../internal/dedupe`. API-level
 coverage lives in a Postman collection, `Task Management Microservices API`
 (17 requests, 15 assertions).
 

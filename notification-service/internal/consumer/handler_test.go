@@ -573,3 +573,171 @@ func TestEachEventTypeRoutesToItsOwnEmail(t *testing.T) {
 		})
 	}
 }
+
+// --- Stage 8: idempotent consumption ---
+
+type fakeDedupe struct {
+	seen     map[string]bool
+	marked   []string
+	seenErr  error
+	markErr  error
+	seenCall int
+}
+
+func newFakeDedupe() *fakeDedupe {
+	return &fakeDedupe{seen: map[string]bool{}}
+}
+
+func (f *fakeDedupe) Seen(_ context.Context, eventID string) (bool, error) {
+	f.seenCall++
+	if f.seenErr != nil {
+		return false, f.seenErr
+	}
+	return f.seen[eventID], nil
+}
+
+func (f *fakeDedupe) MarkProcessed(_ context.Context, eventID string) error {
+	if f.markErr != nil {
+		return f.markErr
+	}
+	f.seen[eventID] = true
+	f.marked = append(f.marked, eventID)
+	return nil
+}
+
+func wiredWithDedupe(lookup *fakeLookup, mailer *fakeMailer, d *fakeDedupe) *Handler {
+	h := wired(lookup, mailer)
+	h.Processed = d
+	return h
+}
+
+// The entire feature in one assertion. Kafka delivers at least once, so the
+// same event genuinely does arrive twice -- after a failed offset commit, a
+// rebalance, a restart mid-batch. Without this the user gets two emails, and
+// there is no way to demonstrate the fix by clicking around.
+func TestSameEventTwiceSendsOneEmail(t *testing.T) {
+	mailer := &fakeMailer{}
+	h := wiredWithDedupe(&fakeLookup{email: "demo@example.com"}, mailer, newFakeDedupe())
+	msg := mustJSON(t, sampleEnvelope(events.EventTaskCreated))
+
+	first, err := h.HandleMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	second, err := h.HandleMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+
+	if len(mailer.created) != 1 {
+		t.Errorf("sent %d emails for the same event, want exactly 1", len(mailer.created))
+	}
+	if first.Action != ActionNotified {
+		t.Errorf("first action = %v, want notified", first.Action)
+	}
+	if second.Action != ActionDuplicate {
+		t.Errorf("second action = %v, want duplicate", second.Action)
+	}
+}
+
+// Two different events must both go out. A dedupe that suppresses everything
+// would pass the test above and be catastrophic.
+func TestDistinctEventsBothSend(t *testing.T) {
+	mailer := &fakeMailer{}
+	h := wiredWithDedupe(&fakeLookup{email: "demo@example.com"}, mailer, newFakeDedupe())
+
+	first := sampleEnvelope(events.EventTaskCreated)
+	second := sampleEnvelope(events.EventTaskCreated)
+	second.EventID = "3f1c2b7e-0000-4000-8000-000000000002"
+
+	if _, err := h.HandleMessage(context.Background(), mustJSON(t, first)); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if _, err := h.HandleMessage(context.Background(), mustJSON(t, second)); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+
+	if len(mailer.created) != 2 {
+		t.Errorf("sent %d emails for two distinct events, want 2", len(mailer.created))
+	}
+}
+
+// The event is recorded only after the send succeeds. Recording first would
+// mean a failed send is never retried -- the redelivery would be waved through
+// as a duplicate and the notification lost silently.
+func TestFailedSendIsNotRecordedAsProcessed(t *testing.T) {
+	d := newFakeDedupe()
+	mailer := &fakeMailer{err: errors.New("smtp: connection refused")}
+	h := wiredWithDedupe(&fakeLookup{email: "demo@example.com"}, mailer, d)
+
+	if _, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated))); err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(d.marked) != 0 {
+		t.Errorf("a failed send was recorded as processed %v; the retry would be "+
+			"skipped as a duplicate and the email never sent", d.marked)
+	}
+}
+
+// A redelivery must not even look up a recipient. Skipping early keeps a
+// duplicate cheap and avoids a pointless database hit per replayed message.
+func TestDuplicateSkipsBeforeLookingUpTheRecipient(t *testing.T) {
+	d := newFakeDedupe()
+	d.seen["3f1c2b7e-0000-4000-8000-000000000001"] = true
+	lookup := &fakeLookup{email: "demo@example.com"}
+	mailer := &fakeMailer{}
+	h := wiredWithDedupe(lookup, mailer, d)
+
+	res, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if res.Action != ActionDuplicate {
+		t.Errorf("action = %v, want duplicate", res.Action)
+	}
+	if len(lookup.calls) != 0 {
+		t.Errorf("a duplicate triggered %d recipient lookups, want 0", len(lookup.calls))
+	}
+	if len(mailer.created) != 0 {
+		t.Error("a duplicate sent an email")
+	}
+}
+
+// A database outage must never be read as "not seen" -- that would send
+// duplicates during exactly the moment things are already going wrong. It is
+// transient, so it must not be an ErrBadMessage either.
+func TestDedupeFailureIsTransientNotADuplicate(t *testing.T) {
+	d := newFakeDedupe()
+	d.seenErr = errors.New("connection refused")
+	mailer := &fakeMailer{}
+	h := wiredWithDedupe(&fakeLookup{email: "demo@example.com"}, mailer, d)
+
+	_, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+	if err == nil {
+		t.Fatal("expected an error when the dedupe store is unreachable")
+	}
+	if errors.Is(err, ErrBadMessage) {
+		t.Error("a dedupe outage was classified as a bad message; the event would be discarded")
+	}
+	if len(mailer.created) != 0 {
+		t.Error("an email was sent despite being unable to check for a duplicate")
+	}
+}
+
+// With no dedupe store wired -- the Stage 5 and 6 shape -- everything still
+// works, just without the guarantee.
+func TestHandlerWithoutDedupeStillSends(t *testing.T) {
+	mailer := &fakeMailer{}
+	h := wired(&fakeLookup{email: "demo@example.com"}, mailer)
+
+	if _, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated))); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if len(mailer.created) != 1 {
+		t.Errorf("sent %d emails, want 1", len(mailer.created))
+	}
+}

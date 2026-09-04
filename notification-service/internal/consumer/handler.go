@@ -30,6 +30,11 @@ import (
 // whether to keep going.
 var ErrBadMessage = errors.New("bad message")
 
+// errAlreadyProcessed is internal control flow, not a failure: it marks an
+// event this consumer has already acted on, which the caller turns into
+// ActionDuplicate and a committed offset.
+var errAlreadyProcessed = errors.New("already processed")
+
 // Action is what a message resulted in. The handler returns it and the loop
 // logs it, rather than the handler logging directly -- otherwise the only way
 // to test the decision would be to capture stdout.
@@ -44,6 +49,9 @@ const (
 	// ActionSkipped means the event was well-formed but carried a type this
 	// build does not handle. Deliberately not an error.
 	ActionSkipped
+	// ActionDuplicate means the event had already been handled and was
+	// deliberately not acted on a second time.
+	ActionDuplicate
 )
 
 func (a Action) String() string {
@@ -52,6 +60,8 @@ func (a Action) String() string {
 		return "notified"
 	case ActionSkipped:
 		return "skipped"
+	case ActionDuplicate:
+		return "duplicate"
 	default:
 		return "failed"
 	}
@@ -65,6 +75,14 @@ func (a Action) String() string {
 type Result struct {
 	Action  Action
 	Summary string
+}
+
+// processedStore is what this package needs from internal/dedupe. Kafka
+// delivers at least once, so the same event really does arrive twice; without a
+// memory of what has been done, twice means two emails.
+type processedStore interface {
+	Seen(ctx context.Context, eventID string) (bool, error)
+	MarkProcessed(ctx context.Context, eventID string) error
 }
 
 // mailer is what this package needs from internal/services. Declared here, by
@@ -84,6 +102,7 @@ type mailer interface {
 type Handler struct {
 	Recipients users.Lookup
 	Mailer     mailer
+	Processed  processedStore
 }
 
 func New() *Handler {
@@ -109,6 +128,9 @@ func (h *Handler) HandleMessage(ctx context.Context, value []byte) (Result, erro
 	switch env.EventType {
 	case events.EventTaskCreated, events.EventTaskUpdated, events.EventTaskDeleted:
 		if err := h.notify(ctx, env); err != nil {
+			if errors.Is(err, errAlreadyProcessed) {
+				return Result{Action: ActionDuplicate, Summary: summary}, nil
+			}
 			return Result{Action: ActionFailed, Summary: summary}, err
 		}
 		return Result{Action: ActionNotified, Summary: summary}, nil
@@ -140,6 +162,23 @@ func (h *Handler) notify(ctx context.Context, env events.Envelope) error {
 		return nil
 	}
 
+	// Checked before the recipient lookup, so a redelivery costs one query
+	// rather than two plus an SMTP round trip.
+	//
+	// An error here is never treated as "not seen". Reading a database outage
+	// as "never handled" would send duplicates during precisely the moment
+	// things are already going wrong, and it is transient, so it is returned
+	// unwrapped for the loop to retry rather than discard.
+	if h.Processed != nil {
+		seen, err := h.Processed.Seen(ctx, env.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return errAlreadyProcessed
+		}
+	}
+
 	to, err := h.Recipients.EmailFor(ctx, env.ActorID)
 	if err != nil {
 		if errors.Is(err, users.ErrNoRecipient) {
@@ -153,19 +192,38 @@ func (h *Handler) notify(ctx context.Context, env events.Envelope) error {
 	// template, which meant a task.deleted would have told the user their
 	// deleted task had just been created. Only unreachable because nothing
 	// published deletes; publishing them is what made it real.
+	var sendErr error
 	switch env.EventType {
 	case events.EventTaskCreated:
-		return h.Mailer.SendTaskCreatedNotification(env.Task, to)
+		sendErr = h.Mailer.SendTaskCreatedNotification(env.Task, to)
 	case events.EventTaskUpdated:
-		return h.Mailer.SendTaskUpdatedNotification(env.Task, to, env.Changes)
+		sendErr = h.Mailer.SendTaskUpdatedNotification(env.Task, to, env.Changes)
 	case events.EventTaskDeleted:
-		return h.Mailer.SendTaskDeletedNotification(env.Task, to)
+		sendErr = h.Mailer.SendTaskDeletedNotification(env.Task, to)
 	default:
 		// Unreachable: HandleMessage has already skipped unknown types. Send
 		// nothing rather than guess, so a future event type added upstream can
 		// never mail the wrong template.
 		return nil
 	}
+	if sendErr != nil {
+		return sendErr
+	}
+
+	// Recorded only after the send succeeded. Recording first would mean a
+	// failed send is never retried: the redelivery would be waved through as a
+	// duplicate and the notification lost silently.
+	//
+	// This leaves a window -- a crash between the send and this write replays
+	// the email -- which is the irreducible one. Closing it would need the
+	// email and the database write to be a single atomic act, and SMTP does not
+	// participate in database transactions.
+	if h.Processed != nil {
+		if err := h.Processed.MarkProcessed(ctx, env.EventID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // decode parses and validates an envelope, rejecting anything that cannot be
