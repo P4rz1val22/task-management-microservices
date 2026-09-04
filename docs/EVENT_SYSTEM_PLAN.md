@@ -342,13 +342,14 @@ cd task-service && go test ./...   # expect: "no test files"
 That is here on purpose. Seeing `no test files` for every package once makes the first real
 test in Stage 2 unmistakably the first.
 
-- [ ] Six containers up; any restart explained rather than shrugged at
-- [ ] All four direct `/health` endpoints report their service name and `healthy`
-- [ ] `/gateway/health` shows all four `*_status` fields `healthy`
-- [ ] Newman run saved, with the one expected `Register User` failure identified by name
-- [ ] Task creation returns 201 through the gateway
-- [ ] Confirmed no notification fires
-- [ ] `go test ./...` runs clean and reports no test files
+- [x] Six containers up; any restart explained rather than shrugged at
+- [x] All four direct `/health` endpoints report their service name and `healthy`
+- [x] `/gateway/health` shows all four `*_status` fields `healthy`
+- [x] Newman run saved; the single failure (`Filter Tasks by Status`) diagnosed as a real
+      nil-slice bug and fixed in `b7742d0` — not the `Register User` failure predicted
+- [x] Task creation returns 201 through the gateway
+- [x] Confirmed no notification fires
+- [x] `go test ./...` runs clean and reports no test files
 
 ---
 
@@ -419,9 +420,9 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --list \
   --bootstrap-server localhost:9092
 ```
 
-- [ ] Broker reaches healthy
-- [ ] `task-events` topic created with 3 partitions
-- [ ] Commit: `feat: add Kafka broker in KRaft mode`
+- [x] Broker reaches healthy
+- [x] `task-events` topic created with 3 partitions
+- [x] Commit: `feat: add Kafka broker in KRaft mode`
 
 **Leave `KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"` on** for local convenience, but know it is
 a thing you would disable in production — a good small interview answer.
@@ -461,10 +462,14 @@ Dependency for `event_id`:
 cd task-service && go get github.com/google/uuid && go mod tidy
 ```
 
-- [ ] Test written first and observed failing to compile
-- [ ] `go test ./internal/events/` passes
-- [ ] `internal/events` imports no Kafka and no gorm — check the import block
-- [ ] Commit: `feat: add task event contract with tests`
+- [x] Test written first and observed failing to compile
+- [x] `go test ./internal/events/` passes
+- [x] `internal/events` imports no `kafka-go`, and never marshals `models.Task`
+      directly — `TestTaskPayloadLeaksNoDatabaseFields` enforces the second half.
+      (The original rule said "no gorm" too. That is unworkable: `internal/models`
+      imports gorm, so any function taking a `models.Task` pulls it in transitively.
+      What actually matters is keeping the Kafka client out and the DB model off the wire.)
+- [x] Commit: `feat: add task event contract with tests`
 
 ---
 
@@ -606,6 +611,11 @@ Port `monolith/internal/services/email.go` into
 - `SendTaskCreatedNotification(task, userEmail)` and
   `SendTaskUpdatedNotification(task, userEmail, changes)` keep their exact signatures, which
   is why the event envelope was shaped to match.
+- **One additive change the ported copy does need:** the monolith's `services.ChangeDetail`
+  declares `Field`, `From`, `To` with *no JSON tags at all*, so Go would marshal them
+  capitalised. `events.ChangeDetail` declares the lowercase wire names. The Go field names
+  match 1:1 — so no signature changes — but the ported struct needs
+  `json:"field"`/`json:"from"`/`json:"to"` added to unmarshal from the envelope.
 
 **RED, and this is the interesting bit:** `email.go` has never had a test in its life. Port it
 first, then write the tests against the ported copy before changing a line of it — the tests
