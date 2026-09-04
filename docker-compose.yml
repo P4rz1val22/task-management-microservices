@@ -33,6 +33,12 @@ services:
       - GIN_MODE=release
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,6 +58,12 @@ services:
       - GIN_MODE=release
     ports:
       - "8082:8082"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,6 +83,12 @@ services:
       - GIN_MODE=release
     ports:
       - "8083:8083"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8083/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,6 +108,12 @@ services:
       - GIN_MODE=release
     ports:
       - "8084:8084"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8084/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,11 +135,21 @@ services:
       - GIN_MODE=release
     ports:
       - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8081/gateway/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
-      - monolith
-      - auth-service
-      - project-service
-      - task-service
+      monolith:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      project-service:
+        condition: service_healthy
+      task-service:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - microservices
