@@ -364,24 +364,47 @@ deliberately not unit tested" above. Verification is the shell below.
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
     ports:
       - "9092:9092"
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 15s
+    restart: unless-stopped
     networks:
       - microservices
 ```
+
+**Two listeners, not one — this is deliberate.** A single `PLAINTEXT://kafka:9092` listener
+advertises the broker as `kafka:9092`, which only resolves inside the compose network. A client
+on the host would connect to `localhost:9092`, be told "the broker is at `kafka:9092`", and fail
+on a name it cannot resolve. That would break the Stage 4 integration tests, which run
+`go test -tags=integration` from the host against a real broker. So there is an INTERNAL
+listener advertised as `kafka:29092` for containers and an EXTERNAL one advertised as
+`localhost:9092` for the host.
+
+**Which address to use where:** services in Compose set `KAFKA_BROKERS=kafka:29092`. Host-side
+integration tests and CLI tools use `localhost:9092`.
+
+**`KAFKA_NUM_PARTITIONS: 3` matters more than it looks.** With auto-create enabled, a producer
+that connects before the topic is explicitly created gets a topic with the broker default of
+**one** partition. Everything would still work — and that is the danger, because with one
+partition the ordering guarantee is trivially satisfied and the partition key provably does
+nothing. The design would look correct while demonstrating nothing, and raising the partition
+count later would break ordering in a way that was never tested. Setting the default to 3 means
+even accidental auto-creation produces the right shape.
 
 Follow the file's existing conventions: `container_name: task-mgmt-*`, the `microservices`
 network, a healthcheck like `postgres` has.
