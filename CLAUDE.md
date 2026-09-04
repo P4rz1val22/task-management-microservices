@@ -1,0 +1,150 @@
+# task-management-microservices
+
+A task management API mid-way through a Strangler Fig decomposition: a Go/Gin
+monolith is being carved into services behind an API gateway. Postgres for
+storage, Docker Compose for local orchestration.
+
+## Layout: five separate Go modules
+
+There is **no root Go module**, so `go test ./...` from the repo root does
+nothing. Every Go command must be run from inside a service directory.
+
+| Directory          | Module path                                    |
+|--------------------|------------------------------------------------|
+| `monolith/`        | `github.com/P4rz1val22/task-management-api`    |
+| `auth-service/`    | `task-management-auth-service`                 |
+| `project-service/` | `task-management-project-service`              |
+| `task-service/`    | `task-management-task-service`                 |
+| `gateway/`         | `task-management-gateway`                      |
+
+To test everything:
+
+```bash
+for m in monolith auth-service project-service task-service gateway; do
+  (cd "$m" && go test ./...)
+done
+```
+
+`monolith/` is the **old** side of the migration. Don't add new capability to
+it; extract from it.
+
+## Running the stack
+
+```bash
+docker compose up --build -d     # cold build across 5 modules takes minutes
+docker compose ps                # all 7 should read (healthy)
+```
+
+Seven containers, all named `task-mgmt-*`:
+
+| Service           | Container             | Host port |
+|-------------------|-----------------------|-----------|
+| `postgres`        | `task-mgmt-postgres`  | 5432      |
+| `monolith`        | `task-mgmt-monolith`  | 8080      |
+| `gateway`         | `task-mgmt-gateway`   | 8081      |
+| `auth-service`    | `task-mgmt-auth`      | 8082      |
+| `project-service` | `task-mgmt-projects`  | 8083      |
+| `task-service`    | `task-mgmt-tasks`     | 8084      |
+| `kafka`           | `task-mgmt-kafka`     | 9092      |
+
+Postgres: user `postgres`, password `password123`, database `taskmanagement`.
+
+```bash
+docker compose exec postgres psql -U postgres -d taskmanagement -c '\dt'
+```
+
+## Health endpoints — two traps
+
+Each service serves `GET /health` on its own port. **The gateway does not.** It
+serves only `GET /gateway/health`. A request to `localhost:8081/health` falls
+through `r.NoRoute(proxy.SmartProxy())` and is answered by the *monolith*, so it
+returns a healthy-looking 200 that says nothing about the gateway.
+
+`/gateway/health` also returns HTTP 200 even when every dependency is
+unreachable, and its `gateway_status` field is a hardcoded literal that can
+never report a problem. Assert on the four `*_status` strings:
+
+```bash
+curl -s localhost:8081/gateway/health | jq '{monolith_status, auth_service_status,
+  project_service_status, task_service_status}'
+```
+
+## Kafka
+
+Topic `task-events`, 3 partitions, keyed by task ID. Two listeners:
+
+- Containers on the compose network use **`kafka:29092`**
+- Anything on the host (CLI tools, integration tests) uses **`localhost:9092`**
+
+Auto-create is on with `KAFKA_NUM_PARTITIONS: 3`, so an accidentally
+auto-created topic still gets the right partition count.
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --describe --topic task-events --bootstrap-server localhost:9092
+```
+
+## Build constraint: no cgo
+
+Every Dockerfile builds `CGO_ENABLED=0` on Alpine. **Do not add a dependency
+that requires cgo** — it means rewriting every Dockerfile and fighting musl.
+This rules out `confluent-kafka-go` (use `segmentio/kafka-go`) and
+`gorm.io/driver/sqlite` (use `go-sqlmock` for tests).
+
+## Testing
+
+Go tests exist only in `task-service/internal/events` so far. API-level
+coverage lives in a Postman collection, `Task Management Microservices API`
+(17 requests, 15 assertions).
+
+The collection is a **cloud object** in Postman, not a file in this repo —
+Postman 11.x is the web app in an Electron shell. Exports live in
+`~/Downloads/`. It is **not idempotent**: re-running against a non-fresh
+database fails three ways, none of them application bugs.
+
+1. `Register User` → 409, hardcoded email already exists (harmless; `Login`
+   re-sets the token immediately after)
+2. `Create Project` / `Update Project` → 409 on hardcoded names, which leaves
+   `project_id` empty and cascades into ~5 downstream failures
+3. `Filter Tasks by Status` → the test queries `?status=Done` then asserts the
+   results are `In Progress`. The test contradicts itself; the endpoint is fine.
+
+For a clean run: `docker compose down -v && docker compose up -d` first. Run
+headlessly with `npx newman run <export.json>` (newman is not installed
+globally; `npx` works).
+
+Integration tests that need a real broker go behind `//go:build integration`
+and run with `go test -tags=integration ./...`, so the default `go test` stays
+fast and needs no Docker.
+
+## Known issues, deliberately unfixed
+
+**Concurrent AutoMigrate race.** All four Go services call GORM `AutoMigrate`
+the instant Postgres reports healthy, and two race to `CREATE TYPE`. The loser
+hits `log.Fatal` and exits; `restart: unless-stopped` recovers it on the next
+attempt. **A container flapping once on a first boot against a fresh database
+is expected, not a fault.** The real fix is a single migration owner (the
+monolith created these tables; the other three don't need to migrate at all).
+
+**~52MB of committed stale binaries** get pulled into every build context,
+since there is no `.dockerignore`: `monolith/out`,
+`task-service/task-management-task-service`, `gateway/task-management-gateway`.
+
+**Expected log noise, not errors.** Every container logs
+`Warning: .env file not found` — `godotenv` looks for `../.env`, which isn't in
+the images. Compose supplies the real variables. The root `.env` (gitignored,
+holds `DATABASE_URL`, `JWT_SECRET`, `GIN_MODE`) is only used when running a
+service on the host from inside its own directory.
+
+## Environment note
+
+`~/Code` is a symlink to `~/Documents/Github/Code`, so `~/Code/task-management-microservices`
+and `~/Documents/Github/Code/task-management-microservices` are the same repo.
+Docker reports paths via the symlink. There is no second copy.
+
+## Current work
+
+`docs/EVENT_SYSTEM_PLAN.md` is the active plan: finishing the migration with a
+Kafka event backbone so notification emails move out of the request path. Ten
+stages, each independently committable. **Every stage that produces Go code
+writes its failing test first.** Read that document before starting a stage.

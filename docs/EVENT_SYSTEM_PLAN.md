@@ -536,6 +536,14 @@ cd task-service && go get github.com/segmentio/kafka-go && go mod tidy
 
 This is the stage that replaces the TODO at `handlers.go:112`.
 
+> **Use plan mode for this stage.** It is the first one with real design choices rather than a
+> single obvious shape: where the `Publisher` seam goes, whether the handler owns the interface
+> or the events package does, how the publish error is swallowed without hiding it, and how far
+> the sqlmock harness should reach. Stages 0–2 did not need it — Stage 0 was pure verification
+> and plan mode actively got in the way there, since the plan-doc corrections it turned up
+> could not be written until after exiting. Here the cost is inverted: getting the seam wrong
+> means redoing Stage 4 and part of Stage 7.
+
 **RED.** Write the handler test first. This one needs the DB, so it is the Layer-2 sqlmock
 setup from section 4. Define a `Publisher` interface in the handlers package (consumer-side
 interface, so handlers depend on what they use) and inject a fake. Assert:
