@@ -1298,3 +1298,132 @@ current working directory: Operation not permitted` while plain `ls` still worke
 began immediately after a Bash call made with the sandbox disabled and cleared on its
 own. If it recurs, avoid disabling the sandbox and have the user run git with the `!`
 prefix.
+
+---
+
+## Stage 9 — complete
+
+Three commits: the collection rescue, the integration tests, and the docs.
+
+### 1. The Postman collection is idempotent
+
+- [x] `Register User` mints a fresh email per run into `test_email`; `Login User`
+      reads the same variable so the pair stays consistent
+- [x] `Create Project` and `Update Project` randomise their names
+- [x] `Filter Tasks by Status` no longer contradicts itself
+- [x] Tests added to the three direct service-health requests
+- [x] Verified with three consecutive `npx newman run`s against the same
+      database, no reset between them
+- [x] Commit: `test: make the Postman collection idempotent and test the health requests`
+
+**The baseline was worse than the handoff notes recorded, and the way it failed
+is the interesting part.** The notes predicted three false failures. What
+actually happened across three consecutive runs on one database was:
+
+| Run | Assertions failed | Why |
+|---|---|---|
+| 1 | 0 of 15 | The hardcoded email and project name were still free |
+| 2 | 2 of 15 | `Register User` and `Update Project` 409 |
+| 3 | **8 of 15** | `Create Project` now 409s too, `project_id` goes empty, and five task assertions fail behind it |
+
+A suite that passes, then fails twice, then fails eight times, is worse than one
+that always fails: the first run teaches you to trust it and the third teaches
+you to ignore it.
+
+**`Filter Tasks by Status` needed the opposite fix from the one planned.** The
+plan said to assert `'Done'` to match the `?status=Done` query. That would have
+made the test self-consistent and still worthless, because `Filter Tasks by
+Status` runs *before* `Update Task` — the only task the run has created is still
+`In Progress`, so `?status=Done` returns an empty list and `forEach` never
+executes a single assertion. The query was the wrong half. It now asks for
+`In Progress` and asserts the created task is in the result, so an empty
+response fails instead of passing. Confirmed by the response size: 135 bytes
+before, 539 after.
+
+Counts moved from "17 requests, 15 assertions" to **17 requests, 17 test
+scripts, 18 assertions** — no more explaining the gap.
+
+### 2. Integration tests for the gateway and the outbox
+
+- [x] `gateway/internal/e2e` — the gateway module's first Go test
+- [x] `task-service/internal/e2e` — the outbox drain end to end
+- [x] Both behind `//go:build integration`; bare `go test ./...` still exits 0
+      without Docker
+- [x] `Makefile` with `test`, `test-integration`, `test-api`, `test-all`
+- [x] Commit: `test: integration coverage for the gateway path and the outbox drain`
+
+`gateway/internal/e2e` uses **the standard library only**. A reverse proxy has
+no business growing a database driver to satisfy a test, so the DB-touching test
+lives in `task-service`, which owns the `outbox` table and already has GORM.
+Each test sits in the module that owns the thing it asserts.
+
+Three claims it makes that nothing else could:
+
+1. A task read back through the gateway carries an enriched project name, which
+   can only be present if `task-service` reached `project-service`. One
+   assertion covering the gateway, two services and the JWT.
+2. Four shapes of bad credential are all rejected with 401, including a
+   well-formed JWT with a forged signature.
+3. `/gateway/health` reports on its dependencies. **Verified non-vacuous by
+   stopping the monolith:** the test reported `monolith_status = unreachable`
+   while the endpoint still returned HTTP 200 — the exact trap that makes
+   asserting the status code meaningless. The flow test stayed green, which is
+   the right independence.
+
+`task-service/internal/e2e` reproduces the Stage 8b scenario as an automated
+test: stop Kafka, create a task, assert 201 **and that it was fast** (a slow
+create means someone reintroduced a synchronous publish), assert the event
+exists as a row with `sent_at` NULL, then start Kafka and watch the poller drain
+it unaided. It drains in about five seconds.
+
+**`-p 1` is load-bearing, and this was found by observation rather than
+foresight.** Go runs separate packages in parallel. The first full run of
+`go test -tags=integration ./...` in `task-service` failed all three publisher
+tests in `internal/events` with `unexpected EOF` and `connection reset by
+peer` — because `internal/e2e` had stopped the broker out from under them. The
+tests were correct and their dependency had been removed by a sibling. Fixed in
+the `Makefile` target and documented in both test files, since a suite that
+fails when run the obvious way is a broken suite.
+
+Also corrected a wrong enum guessed while writing the test: valid statuses are
+`Not Started`, `In Progress`, `Done`, `Blocked` — not `To Do`.
+
+### 3. Docs
+
+- [x] README architecture section and diagram show the broker, the outbox, the
+      consumer and the dead-letter topic
+- [x] README documents the three test tiers and the build-tag split
+- [x] Four dead documentation links removed; every path now resolves
+- [x] `CLAUDE.md` updated — it claimed the collection was not idempotent and that
+      integration tests run without `-p 1`, both now false
+- [x] Commit: `docs: bring the README up to date with the event backbone and the test tiers`
+
+The README had drifted badly: it described a five-service, four-container stack
+with no broker, and linked `api-documentation.md`, `deployment-guide.md`,
+`architecture-decisions.md` and `postman-collection.json`, **none of which
+exist**. It also carried two enum lists that disagreed with the handler source,
+which were corrected against the code rather than the old text.
+
+### Final counts for the Knowledge Bank
+
+- **6** Go modules, **8** containers, **3** event types, **2** Kafka topics
+  (`task-events`, `task-events.dlq`)
+- **171** Go unit tests, no Docker required — 87 in `task-service`, 84 in
+  `notification-service`
+- **8** integration test functions across 3 packages, behind `-tags=integration`
+- **17** Postman requests, 17 test scripts, **18** assertions, idempotent
+- Tables owned by this work: `outbox` (task-service), `processed_events`
+  (notification-service)
+
+**The honest framing of the testing claim**, which matters because the
+overclaimed version collapses under one question: this work *extended* coverage,
+it did not introduce it. The project already had a 17-request Postman suite at
+the API boundary. What this added is Go unit coverage below that boundary where
+the event logic lives, and integration coverage above it where the services
+meet. `monolith`, `auth-service` and `project-service` still have no Go tests.
+
+### Still open (section 7)
+
+Stage 9 is done. The remaining close-the-loop items are personal-artifact work,
+not repository work: logging this to the Experience Knowledge Bank, and
+re-tailoring the Chewy resume around the event system.

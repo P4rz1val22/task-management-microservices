@@ -18,13 +18,13 @@ nothing. Every Go command must be run from inside a service directory.
 | `gateway/`         | `task-management-gateway`                      |
 | `notification-service/` | `task-management-notification-service`    |
 
-To test everything:
+To test everything, use the `Makefile` — it does this loop for you, and its
+targets are the documented interface (see Testing below):
 
 ```bash
-for m in monolith auth-service project-service task-service gateway \
-         notification-service; do
-  (cd "$m" && go test ./...)
-done
+make test              # unit, no Docker needed
+make test-integration  # needs the stack up; passes -p 1, which matters
+make test-api          # the Postman collection via newman
 ```
 
 `monolith/` is the **old** side of the migration. Don't add new capability to
@@ -33,7 +33,7 @@ it; extract from it.
 ## Running the stack
 
 ```bash
-docker compose up --build -d     # cold build across 5 modules takes minutes
+docker compose up --build -d     # or `make up`; cold build takes minutes
 docker compose ps                # 7 read (healthy); notification-service has
                                  # no healthcheck and just reads "Up"
 ```
@@ -126,31 +126,54 @@ This rules out `confluent-kafka-go` (use `segmentio/kafka-go`) and
 
 ## Testing
 
-Go tests live in `task-service/internal/events`, `task-service/internal/handlers`
-`notification-service/internal/consumer`, `.../internal/services`,
-`.../internal/users` and `.../internal/dedupe`. API-level
-coverage lives in a Postman collection, `Task Management Microservices API`
-(17 requests, 15 assertions).
+Three tiers, each with a `Makefile` target. **Use the targets** — they loop over
+the six modules, which is necessary because there is no root Go module.
 
-The collection is a **cloud object** in Postman, not a file in this repo —
-Postman 11.x is the web app in an Electron shell. Exports live in
-`~/Downloads/`. It is **not idempotent**: re-running against a non-fresh
-database fails three ways, none of them application bugs.
+```bash
+make test              # unit, 171 tests, no Docker
+make test-integration  # needs `docker compose up -d`
+make test-api          # the Postman collection via newman
+```
 
-1. `Register User` → 409, hardcoded email already exists (harmless; `Login`
-   re-sets the token immediately after)
-2. `Create Project` / `Update Project` → 409 on hardcoded names, which leaves
-   `project_id` empty and cascades into ~5 downstream failures
-3. `Filter Tasks by Status` → the test queries `?status=Done` then asserts the
-   results are `In Progress`. The test contradicts itself; the endpoint is fine.
+**Unit tests** live in `task-service/internal/{events,outbox,handlers}` and
+`notification-service/internal/{consumer,services,users,dedupe}`, all against a
+mock database. `monolith`, `auth-service` and `project-service` have **no Go
+tests at all**; the gateway has integration coverage only.
 
-For a clean run: `docker compose down -v && docker compose up -d` first. Run
-headlessly with `npx newman run <export.json>` (newman is not installed
-globally; `npx` works).
+**Integration tests** go behind `//go:build integration`, so the default
+`go test` stays fast and needs no Docker. Three packages:
+`task-service/internal/events` (real broker), `gateway/internal/e2e` (HTTP
+through the gateway, stdlib only) and `task-service/internal/e2e` (the outbox
+drain).
 
-Integration tests that need a real broker go behind `//go:build integration`
-and run with `go test -tags=integration ./...`, so the default `go test` stays
-fast and needs no Docker.
+`-p 1` is required and `make test-integration` passes it. Go runs separate
+packages in parallel, and `task-service/internal/e2e` **stops the Kafka
+container** to prove the outbox survives an outage; without `-p 1` that pulls
+the broker out from under the publisher tests in `internal/events`, which then
+fail for reasons unrelated to them. Confirmed by observation, not theory.
+
+Integration tests read **`TEST_DATABASE_URL`, not `DATABASE_URL`** — the root
+`.env` points `DATABASE_URL` at a hosted Neon database, and picking that up
+would silently assert against the wrong database. Also overridable:
+`GATEWAY_URL`, `KAFKA_BROKERS`, `REPO_ROOT`.
+
+**API-level coverage** is the Postman collection `Task Management Microservices
+API` — 17 requests, 17 test scripts, 18 assertions — committed at
+`docs/postman/`. It is a **cloud object** in Postman as well (Postman 11.x is
+the web app in an Electron shell), so the committed file is an export and the
+two drift unless re-exported after a change in the app.
+
+**The collection is now idempotent**, so it does not need a fresh database. It
+used to fail 8 of 15 assertions on a re-run: `Register User`, `Create Project`
+and `Update Project` posted hardcoded values that collided on unique
+constraints, and the empty `project_id` cascaded downstream. Those values are
+now minted per run in pre-request scripts (`test_email`, `test_project_name`,
+`test_project_updated_name`).
+
+`Filter Tasks by Status` used to query `?status=Done` while asserting
+`In Progress`. It now queries `In Progress` — the status the task actually holds
+at that point in the run, since `Update Task` sets `Done` later — and asserts the
+created task is in the result, so an empty list can no longer pass silently.
 
 ## Outbox
 
