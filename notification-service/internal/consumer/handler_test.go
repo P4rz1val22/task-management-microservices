@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"task-management-notification-service/internal/events"
+	"task-management-notification-service/internal/users"
 )
 
 func sampleEnvelope(eventType string) events.Envelope {
@@ -245,5 +247,258 @@ func TestBadMessageErrorsAreIdentifiable(t *testing.T) {
 	if !errors.Is(err, ErrBadMessage) {
 		t.Errorf("error %v does not wrap ErrBadMessage; the loop cannot tell "+
 			"a poison message from a broker failure", err)
+	}
+}
+
+// --- Stage 6: the handler now looks up a recipient and sends an email ---
+
+type fakeLookup struct {
+	email string
+	err   error
+	calls []uint
+}
+
+func (f *fakeLookup) EmailFor(_ context.Context, userID uint) (string, error) {
+	f.calls = append(f.calls, userID)
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.email, nil
+}
+
+type fakeMailer struct {
+	created []string // recipient per created-email call
+	updated []string
+	changes [][]events.ChangeDetail
+	err     error
+}
+
+func (f *fakeMailer) SendTaskCreatedNotification(_ events.TaskPayload, to string) error {
+	f.created = append(f.created, to)
+	return f.err
+}
+
+func (f *fakeMailer) SendTaskUpdatedNotification(_ events.TaskPayload, to string, ch []events.ChangeDetail) error {
+	f.updated = append(f.updated, to)
+	f.changes = append(f.changes, ch)
+	return f.err
+}
+
+func wired(lookup *fakeLookup, mailer *fakeMailer) *Handler {
+	h := New()
+	h.Recipients = lookup
+	h.Mailer = mailer
+	return h
+}
+
+// The event carries actor_id; the address comes from the database. That
+// indirection is deliberate -- an address is mutable personal data and freezing
+// it into every event on the topic would be wrong.
+func TestCreatedEventSendsToTheActorsAddress(t *testing.T) {
+	lookup := &fakeLookup{email: "demo@example.com"}
+	mailer := &fakeMailer{}
+	h := wired(lookup, mailer)
+
+	res, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if res.Action != ActionNotified {
+		t.Errorf("action = %v, want notified", res.Action)
+	}
+	if len(lookup.calls) != 1 || lookup.calls[0] != 7 {
+		t.Errorf("recipient looked up for %v, want [7] (the actor_id)", lookup.calls)
+	}
+	if len(mailer.created) != 1 || mailer.created[0] != "demo@example.com" {
+		t.Errorf("created email sent to %v, want [demo@example.com]", mailer.created)
+	}
+	if len(mailer.updated) != 0 {
+		t.Errorf("an update email was sent for a created event")
+	}
+}
+
+func TestUpdatedEventSendsTheChangeList(t *testing.T) {
+	lookup := &fakeLookup{email: "demo@example.com"}
+	mailer := &fakeMailer{}
+	h := wired(lookup, mailer)
+
+	env := sampleEnvelope(events.EventTaskUpdated)
+	env.Changes = []events.ChangeDetail{{Field: "Status", From: "Not Started", To: "Done"}}
+
+	if _, err := h.HandleMessage(context.Background(), mustJSON(t, env)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if len(mailer.updated) != 1 {
+		t.Fatalf("sent %d update emails, want 1", len(mailer.updated))
+	}
+	if len(mailer.changes[0]) != 1 || mailer.changes[0][0].Field != "Status" {
+		t.Errorf("changes passed to the mailer = %v, want the Status diff", mailer.changes[0])
+	}
+	if len(mailer.created) != 0 {
+		t.Error("a created email was sent for an update event")
+	}
+}
+
+// An unknown event type must not send anything, and must not look anyone up.
+func TestSkippedEventSendsNothing(t *testing.T) {
+	lookup := &fakeLookup{email: "demo@example.com"}
+	mailer := &fakeMailer{}
+	h := wired(lookup, mailer)
+
+	res, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope("task.archived")))
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if res.Action != ActionSkipped {
+		t.Errorf("action = %v, want skipped", res.Action)
+	}
+	if len(mailer.created)+len(mailer.updated) != 0 {
+		t.Error("an unrecognised event type produced an email")
+	}
+	if len(lookup.calls) != 0 {
+		t.Error("an unrecognised event type triggered a database lookup")
+	}
+}
+
+// A user who does not exist can never be emailed, so the message is poison:
+// discard it, commit the offset, keep the partition moving.
+func TestMissingRecipientIsABadMessage(t *testing.T) {
+	lookup := &fakeLookup{err: fmt.Errorf("%w: no user 7", users.ErrNoRecipient)}
+	mailer := &fakeMailer{}
+	h := wired(lookup, mailer)
+
+	_, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrBadMessage) {
+		t.Errorf("error %v is not an ErrBadMessage; the loop would retry forever", err)
+	}
+}
+
+// The opposite case, and the one that matters most: a database outage or an
+// SMTP failure is TRANSIENT. Marking it as a bad message would discard a
+// perfectly good event and the user would never be told about their task.
+func TestTransientFailuresAreNotBadMessages(t *testing.T) {
+	t.Run("database down", func(t *testing.T) {
+		lookup := &fakeLookup{err: errors.New("connection refused")}
+		h := wired(lookup, &fakeMailer{})
+
+		_, err := h.HandleMessage(context.Background(),
+			mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, ErrBadMessage) {
+			t.Error("a database outage was classified as a bad message; the event would be discarded")
+		}
+	})
+
+	t.Run("smtp down", func(t *testing.T) {
+		lookup := &fakeLookup{email: "demo@example.com"}
+		h := wired(lookup, &fakeMailer{err: errors.New("smtp: connection refused")})
+
+		_, err := h.HandleMessage(context.Background(),
+			mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, ErrBadMessage) {
+			t.Error("an SMTP outage was classified as a bad message; the event would be discarded")
+		}
+	})
+}
+
+// A handler with no mailer wired -- which is what New() returns -- must still
+// work, so the Stage 5 log-only behaviour remains available and no test can
+// nil-panic.
+func TestHandlerWithoutMailerStillProcesses(t *testing.T) {
+	h := New()
+	res, err := h.HandleMessage(context.Background(),
+		mustJSON(t, sampleEnvelope(events.EventTaskCreated)))
+	if err != nil {
+		t.Fatalf("HandleMessage with no mailer: %v", err)
+	}
+	if res.Action != ActionNotified {
+		t.Errorf("action = %v, want notified", res.Action)
+	}
+}
+
+// --- retry policy: transient failures must not be committed away ---
+
+// countingHandler fails a set number of times before succeeding, so the retry
+// policy can be tested without a broker.
+type countingHandler struct {
+	failures int
+	err      error
+	calls    int
+}
+
+func (c *countingHandler) process(_ context.Context, _ []byte) (Result, error) {
+	c.calls++
+	if c.calls <= c.failures {
+		return Result{Action: ActionFailed}, c.err
+	}
+	return Result{Action: ActionNotified, Summary: "ok"}, nil
+}
+
+// Stage 6 made this path live: before it, every failure the handler could
+// produce was a bad message. Now the database or the mail server can be down,
+// and committing the offset on the first stumble throws away a notification
+// that would have succeeded a moment later.
+func TestTransientFailureIsRetried(t *testing.T) {
+	c := &countingHandler{failures: 2, err: errors.New("connection refused")}
+
+	res, err := processWithRetry(context.Background(), c.process, nil, time.Millisecond)
+	if err != nil {
+		t.Fatalf("processWithRetry: %v", err)
+	}
+	if res.Action != ActionNotified {
+		t.Errorf("action = %v, want notified after the retries succeeded", res.Action)
+	}
+	if c.calls != 3 {
+		t.Errorf("handler called %d times, want 3 (two failures then success)", c.calls)
+	}
+}
+
+// A poison message must not be retried at all: it cannot succeed, and retrying
+// only holds the partition up.
+func TestBadMessageIsNotRetried(t *testing.T) {
+	c := &countingHandler{failures: 99, err: fmt.Errorf("%w: broken", ErrBadMessage)}
+
+	if _, err := processWithRetry(context.Background(), c.process, nil, time.Millisecond); err == nil {
+		t.Fatal("expected an error")
+	}
+	if c.calls != 1 {
+		t.Errorf("handler called %d times for a bad message, want 1", c.calls)
+	}
+}
+
+func TestRetriesAreBounded(t *testing.T) {
+	c := &countingHandler{failures: 99, err: errors.New("still down")}
+
+	if _, err := processWithRetry(context.Background(), c.process, nil, time.Millisecond); err == nil {
+		t.Fatal("expected an error after exhausting retries")
+	}
+	if c.calls != maxProcessAttempts {
+		t.Errorf("handler called %d times, want maxProcessAttempts = %d", c.calls, maxProcessAttempts)
+	}
+}
+
+// A shutdown mid-retry must stop promptly rather than sleeping out the backoff.
+func TestRetryStopsOnContextCancel(t *testing.T) {
+	c := &countingHandler{failures: 99, err: errors.New("still down")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := processWithRetry(ctx, c.process, nil, time.Second); err == nil {
+		t.Fatal("expected an error")
+	}
+	if c.calls > 1 {
+		t.Errorf("handler called %d times with a cancelled context, want 1", c.calls)
 	}
 }

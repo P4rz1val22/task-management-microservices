@@ -103,6 +103,59 @@ func readerConfig(cfg Config) kafka.ReaderConfig {
 	}
 }
 
+// Retry policy for a single message.
+//
+// Stage 6 is what made this necessary. Until then every failure the handler
+// could produce was a permanent one, so committing after a failure was
+// harmless. Now a database outage or an unreachable mail server can fail a
+// message that would succeed moments later, and committing on the first
+// stumble would throw the notification away with only a log line to show for
+// it.
+//
+// This is not the full answer -- that is Stage 8's dead-letter topic, which
+// replaces the give-up branch below with a durable record. What it does buy is
+// that a blink no longer costs an event.
+const (
+	maxProcessAttempts = 3
+	processRetryDelay  = 500 * time.Millisecond
+)
+
+// processFunc is the shape of Handler.HandleMessage, taken as a parameter so
+// the retry policy is testable without a broker.
+type processFunc func(context.Context, []byte) (Result, error)
+
+// processWithRetry runs process until it succeeds, hits a permanent error, or
+// runs out of attempts.
+func processWithRetry(ctx context.Context, process processFunc, value []byte, delay time.Duration) (Result, error) {
+	var res Result
+	var err error
+
+	for attempt := 0; attempt < maxProcessAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return res, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		res, err = process(ctx, value)
+		if err == nil {
+			return res, nil
+		}
+		// A bad message cannot be fixed by trying again, and retrying it only
+		// delays everything queued behind it.
+		if errors.Is(err, ErrBadMessage) {
+			return res, err
+		}
+		if ctx.Err() != nil {
+			return res, err
+		}
+	}
+
+	return res, err
+}
+
 // Run consumes until ctx is cancelled, returning nil on a clean shutdown.
 //
 // The loop deliberately owns no decisions: it fetches, hands the bytes to the
@@ -128,7 +181,7 @@ func Run(ctx context.Context, reader *kafka.Reader, h *Handler) error {
 			return err
 		}
 
-		res, handleErr := h.HandleMessage(ctx, msg.Value)
+		res, handleErr := processWithRetry(ctx, h.HandleMessage, msg.Value, processRetryDelay)
 		switch {
 		case handleErr != nil && errors.Is(handleErr, ErrBadMessage):
 			// Poison message. Commit it and move on: leaving it uncommitted
@@ -137,13 +190,21 @@ func Run(ctx context.Context, reader *kafka.Reader, h *Handler) error {
 			// dead-letter topic instead of only logging them.
 			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d DISCARDED: %v",
 				msg.Partition, msg.Offset, handleErr)
+		case errors.Is(handleErr, context.Canceled):
+			// Shutting down mid-retry. Return without committing so the message
+			// is redelivered to whoever picks up this partition next.
+			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d deferred, shutting down",
+				msg.Partition, msg.Offset)
+			return nil
 		case handleErr != nil:
-			// Nothing reaches this branch yet -- every failure the handler can
-			// produce today is a bad message. It becomes live in Stage 6, when
-			// a real SMTP send can fail transiently, and committing here would
-			// then be wrong: that is where retry-then-dead-letter goes.
-			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d FAILED: %v",
-				msg.Partition, msg.Offset, handleErr)
+			// Transient, and it survived every retry. The offset is still
+			// committed, so this event IS LOST -- said plainly because it is a
+			// real hole, not a shrug. Stage 8 replaces this branch with a
+			// dead-letter publish, which is what makes it recoverable. Not
+			// committing instead would wedge the partition and lose every event
+			// behind it too, which is strictly worse.
+			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d EVENT LOST after %d attempts: %v",
+				msg.Partition, msg.Offset, maxProcessAttempts, handleErr)
 		default:
 			log.Printf("[NOTIFICATION-SERVICE] partition=%d offset=%d key=%s %s: %s",
 				msg.Partition, msg.Offset, string(msg.Key), res.Action, res.Summary)

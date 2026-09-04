@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"task-management-notification-service/internal/events"
+	"task-management-notification-service/internal/users"
 )
 
 // ErrBadMessage marks a message that will never succeed no matter how often it
@@ -66,12 +67,23 @@ type Result struct {
 	Summary string
 }
 
+// mailer is what this package needs from internal/services. Declared here, by
+// the consumer, so the handler tests need no SMTP and no HTML.
+type mailer interface {
+	SendTaskCreatedNotification(task events.TaskPayload, to string) error
+	SendTaskUpdatedNotification(task events.TaskPayload, to string, changes []events.ChangeDetail) error
+}
+
 // Handler processes one event at a time.
 //
-// It holds no state today. It is a struct rather than a bare function because
-// Stage 6 gives it an email service and Stage 8 gives it a dedupe store, and
-// having the seam already there means neither stage has to reshape the loop.
-type Handler struct{}
+// Both dependencies are optional. With neither set -- which is what New()
+// returns -- the handler behaves exactly as it did in Stage 5, recognising
+// events and describing them without sending anything. That is what keeps the
+// log-only mode available and stops a half-wired binary from panicking.
+type Handler struct {
+	Recipients users.Lookup
+	Mailer     mailer
+}
 
 func New() *Handler {
 	return &Handler{}
@@ -82,7 +94,7 @@ func New() *Handler {
 // It never panics, whatever arrives on the topic. That is not defensive
 // paranoia: the topic is shared, auto-created, and reachable by any console
 // tool on the network, so "something unparseable turns up" is a matter of when.
-func (h *Handler) HandleMessage(_ context.Context, value []byte) (Result, error) {
+func (h *Handler) HandleMessage(ctx context.Context, value []byte) (Result, error) {
 	env, err := decode(value)
 	if err != nil {
 		return Result{Action: ActionFailed}, err
@@ -95,7 +107,9 @@ func (h *Handler) HandleMessage(_ context.Context, value []byte) (Result, error)
 
 	switch env.EventType {
 	case events.EventTaskCreated, events.EventTaskUpdated, events.EventTaskDeleted:
-		// Stage 6 replaces this with a real send.
+		if err := h.notify(ctx, env); err != nil {
+			return Result{Action: ActionFailed, Summary: summary}, err
+		}
 		return Result{Action: ActionNotified, Summary: summary}, nil
 	default:
 		// Forward compatibility: a producer running ahead of this build will
@@ -103,6 +117,43 @@ func (h *Handler) HandleMessage(_ context.Context, value []byte) (Result, error)
 		// moving; erroring would wedge it behind a message that is not even
 		// malformed.
 		return Result{Action: ActionSkipped, Summary: summary}, nil
+	}
+}
+
+// notify resolves the recipient and sends the mail.
+//
+// The error classification here is the whole point of the function, and it is
+// the difference between a lost notification and a wedged partition:
+//
+//   - A missing or address-less user is PERMANENT. No retry can invent an
+//     address, so it becomes an ErrBadMessage and the loop discards it.
+//   - A database outage or an SMTP failure is TRANSIENT and is returned
+//     unwrapped, so the loop can retry it (Stage 8) rather than throw the
+//     event away.
+//
+// Getting these backwards is silent either way: one drops good events, the
+// other retries hopeless ones forever.
+func (h *Handler) notify(ctx context.Context, env events.Envelope) error {
+	if h.Recipients == nil || h.Mailer == nil {
+		// Stage 5 behaviour: recognise and describe, send nothing.
+		return nil
+	}
+
+	to, err := h.Recipients.EmailFor(ctx, env.ActorID)
+	if err != nil {
+		if errors.Is(err, users.ErrNoRecipient) {
+			return fmt.Errorf("%w: %v", ErrBadMessage, err)
+		}
+		return err
+	}
+
+	switch env.EventType {
+	case events.EventTaskUpdated:
+		return h.Mailer.SendTaskUpdatedNotification(env.Task, to, env.Changes)
+	default:
+		// Created and deleted both use the created template for now. Stage 7
+		// decides whether task.deleted gets one of its own.
+		return h.Mailer.SendTaskCreatedNotification(env.Task, to)
 	}
 }
 

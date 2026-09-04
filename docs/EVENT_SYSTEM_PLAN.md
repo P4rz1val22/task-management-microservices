@@ -793,11 +793,79 @@ Then assert, with a fake sender:
 **GREEN.** Wire `handleEvent` to call the email service. Put `SMTP_USERNAME`/`SMTP_PASSWORD`
 in Compose for this service.
 
-- [ ] Ported `email.go` has tests before any modification
-- [ ] Change-rendering test covers "unchanged fields absent"
-- [ ] Task creation produces a "would send" log with SMTP unset
-- [ ] With real credentials, an email actually arrives
-- [ ] Commit: `feat: send task notifications from notification-service`
+- [x] Ported `email.go` has tests before any modification
+- [x] Change-rendering test covers "unchanged fields absent"
+- [x] Task creation produces a "would send" log with SMTP unset
+- [ ] With real credentials, an email actually arrives — **deliberately not done.**
+      SMTP is left unconfigured; `SMTP_USERNAME`/`SMTP_PASSWORD` are present but
+      empty in Compose, so the service renders every email and logs
+      `would send: <subject> to <address>`. Turning it on is two environment
+      variables and no code change.
+- [x] Commit: `feat: send task notifications from notification-service`
+
+**Four deliberate deviations from a straight port**, all documented in the file
+header:
+
+1. **`Send*Notification` return an error.** The monolith's versions logged and
+   returned nothing, which was survivable inside a fire-and-forget goroutine and
+   is not here — the consumer has to tell a transient failure from a permanent
+   one, and it cannot do that with a swallowed error. This is the one place the
+   plan said to keep signatures identical and the port does not.
+2. **They take `events.TaskPayload`, not `models.Task`.** The payload is what
+   arrives on the wire, and taking it directly keeps gorm out of this package.
+3. **There is no `services.ChangeDetail`.** The plan expected to port that
+   struct and add JSON tags; since the diff already arrives as
+   `events.ChangeDetail` with the right tags, a second identical struct would be
+   pure duplication. The Go field names still match the monolith's, which is
+   what the plan actually needed.
+4. **SMTP sits behind a one-method `mailSender`,** so rendering is testable
+   without a mail server. Also fixed while porting: the original logged
+   `SMTP_USERNAME` in the clear at startup. Both credentials are masked now.
+
+**Recipient lookup** is `internal/users`, reading the shared `users` table keyed
+off the event's `actor_id`. The envelope carries a user ID rather than an address
+on purpose — an address is mutable personal data and freezing it into every event
+on the topic would be wrong. The query selects the `email` column alone rather
+than the row, so the bcrypt hash never enters this process;
+`TestLookupSelectsOnlyTheEmailColumn` enforces that against the SQL GORM actually
+emits. `internal/database` deliberately does **not** call `AutoMigrate`, so this
+service does not join the four-way migration race documented in CLAUDE.md.
+
+**Stage 6 activated a latent hole, and closing it was in scope.** Until this
+stage every failure the handler could produce was permanent, so the loop
+committing after a failure was harmless. A live email path makes a database
+outage or an unreachable mail server able to fail a message that would succeed
+moments later — and the loop would have committed it away with only a log line.
+The fix is a bounded retry (3 attempts, 500ms apart) that skips permanent errors
+entirely. It is **not** the full answer: after the retries are exhausted the
+offset is still committed and the event is genuinely lost, logged as
+`EVENT LOST after 3 attempts`. Stage 8's dead-letter topic replaces that branch.
+Not committing instead would wedge the partition and lose everything behind it,
+which is strictly worse.
+
+**The error classification is the load-bearing decision here**, and both
+directions are tested because both fail silently:
+
+| Condition | Classification | Consequence |
+|---|---|---|
+| Malformed JSON, missing `event_id`/`actor_id` | permanent | discarded, offset committed |
+| User does not exist, or has no address | permanent | discarded — no retry invents an address |
+| Postgres unreachable | transient | retried, then lost with a loud log |
+| SMTP unreachable | transient | retried, then lost with a loud log |
+
+**Observed end to end:**
+
+| Check | Result |
+|---|---|
+| Create a task through the gateway | Address resolved from Postgres via `actor_id`, email rendered, `would send` logged |
+| `docker compose stop postgres`, publish an event | 3 attempts, then `EVENT LOST` naming the real cause; partition kept moving |
+| `docker compose start postgres`, create a task | Notifications resume with no intervention |
+
+**Version pin worth knowing:** `go mod tidy` initially resolved gorm 1.31.2,
+which requires Go 1.25 and broke the 1.24.5 Alpine build. Pinned to gorm 1.30.1 /
+driver-postgres 1.6.0 / pgx 5.6.0 to match `task-service`. `go.sum` mentions
+`go-sqlite3` from walking the module graph; it is not imported, not in the build
+graph, and `CGO_ENABLED=0` builds clean.
 
 ---
 

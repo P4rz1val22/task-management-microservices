@@ -108,7 +108,8 @@ This rules out `confluent-kafka-go` (use `segmentio/kafka-go`) and
 ## Testing
 
 Go tests live in `task-service/internal/events`, `task-service/internal/handlers`
-and `notification-service/internal/consumer`. API-level
+`notification-service/internal/consumer`, `.../internal/services` and
+`.../internal/users`. API-level
 coverage lives in a Postman collection, `Task Management Microservices API`
 (17 requests, 15 assertions).
 

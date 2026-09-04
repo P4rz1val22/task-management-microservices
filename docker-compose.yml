@@ -177,8 +177,19 @@ services:
       # exact string, so changing it resets the service to the start of the
       # topic and re-notifies every task ever created.
       - KAFKA_GROUP_ID=notification-service
-      # Unused in Stage 5; Stage 6 needs it to look up the recipient's address.
+      # Used to resolve an event's actor_id to the address to notify. The
+      # envelope carries a user ID rather than an address on purpose: an address
+      # is mutable personal data and freezing it into every event on the topic
+      # would be wrong.
       - DATABASE_URL=postgres://postgres:password123@postgres:5432/taskmanagement?sslmode=disable
+      # SMTP is deliberately left unconfigured. With these empty the service
+      # renders every email and logs "would send: <subject> to <address>"
+      # instead of delivering it, which exercises the whole pipeline with
+      # nothing leaving the machine. To send for real, set both to a Gmail
+      # address and a 16-character app password -- and put them somewhere
+      # gitignored rather than here.
+      - SMTP_USERNAME=
+      - SMTP_PASSWORD=
     depends_on:
       # service_healthy here, unlike task-service. The asymmetry is the whole
       # design: the producer must never wait on the broker, because a write path
