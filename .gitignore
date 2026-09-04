@@ -86,3 +86,5 @@ coverage.html
 *.pem
 *.key
 *.crt
+# Claude Code personal settings (shared settings live in .claude/settings.json)
+.claude/settings.local.json
