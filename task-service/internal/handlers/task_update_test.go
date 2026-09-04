@@ -4,8 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"testing"
-
-	"task-management-task-service/internal/events"
 )
 
 // updateBody returns a full update request. The API replaces the whole task, so
@@ -28,13 +26,13 @@ func unchangedBody() string {
 		"Not Started", "Low", "S", "2026-09-30")
 }
 
-// The rule this whole stage is built around. Hitting save without editing
-// anything is something real users do constantly, and it must not mail them.
-func TestUpdateWithNoChangesPublishesNothing(t *testing.T) {
+// Stage 7's rule, re-proved at the new seam. Hitting save without editing
+// anything is something real users do constantly, and it must not write an
+// event -- the save still happens, the outbox row does not.
+func TestUpdateWithNoChangesRecordsNoEvent(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
-	expectTaskSave(mock)
-	pub := usePublisher(t, &fakePublisher{})
+	expectTaskSave(mock) // BEGIN, projects upsert, UPDATE tasks, COMMIT -- no outbox
 
 	c, rec := newTestContext(t, unchangedBody())
 	c.Params = ginParams("id", "42")
@@ -43,17 +41,16 @@ func TestUpdateWithNoChangesPublishesNothing(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200. body: %s", rec.Code, rec.Body.String())
 	}
-	if len(pub.calls) != 0 {
-		t.Errorf("a no-op update published %d events (%+v), want 0",
-			len(pub.calls), pub.calls)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a no-op update wrote an event: %v", err)
 	}
 }
 
-func TestUpdatePublishesOnlyTheChangedFields(t *testing.T) {
+// A real edit writes its event inside the same transaction as the save.
+func TestUpdateWritesTheEventInTheSameTransaction(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
-	expectTaskSave(mock)
-	pub := usePublisher(t, &fakePublisher{})
+	expectTaskSaveWithOutbox(mock)
 
 	// Status and priority change; everything else is resent as-is.
 	c, rec := newTestContext(t, updateBody("Original title", "Original description",
@@ -64,87 +61,45 @@ func TestUpdatePublishesOnlyTheChangedFields(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200. body: %s", rec.Code, rec.Body.String())
 	}
-	if len(pub.calls) != 1 {
-		t.Fatalf("published %d events, want 1", len(pub.calls))
-	}
-
-	call := pub.calls[0]
-	if call.eventType != events.EventTaskUpdated {
-		t.Errorf("event type = %q, want %q", call.eventType, events.EventTaskUpdated)
-	}
-	if len(call.changes) != 2 {
-		t.Fatalf("published %d changes %+v, want 2", len(call.changes), call.changes)
-	}
-	if call.changes[0].Field != "Status" || call.changes[0].To != "Done" {
-		t.Errorf("change 0 = %+v, want Status -> Done", call.changes[0])
-	}
-	if call.changes[1].Field != "Priority" || call.changes[1].To != "Urgent" {
-		t.Errorf("change 1 = %+v, want Priority -> Urgent", call.changes[1])
-	}
-	if call.actorID != testActorID {
-		t.Errorf("actor = %d, want %d", call.actorID, testActorID)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the save and its event were not written together: %v", err)
 	}
 }
 
 // The diff has to be taken against the values as they were, so the capture must
 // happen before the request is applied. Reading them afterwards would compare
 // the task to itself and every update would look like a no-op.
+// The diff is taken against the pre-update snapshot. If it were taken after the
+// assignments, every update would compare the task to itself, look like a no-op,
+// and write no event at all -- so the presence of the outbox row here is what
+// proves the snapshot is real. The from/to values themselves are covered
+// exhaustively by TestDiffTask in internal/events.
 func TestUpdateDiffsAgainstTheOriginalValues(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
-	expectTaskSave(mock)
-	pub := usePublisher(t, &fakePublisher{})
+	expectTaskSaveWithOutbox(mock)
 
 	c, _ := newTestContext(t, updateBody("Renamed", "Original description",
 		"Not Started", "Low", "S", "2026-09-30"))
 	c.Params = ginParams("id", "42")
 	UpdateTask(c)
 
-	if len(pub.calls) != 1 {
-		t.Fatalf("published %d events, want 1", len(pub.calls))
-	}
-	ch := pub.calls[0].changes
-	if len(ch) != 1 {
-		t.Fatalf("changes = %+v, want exactly one", ch)
-	}
-	if ch[0].From != "Original title" {
-		t.Errorf("from = %q, want the pre-update value %q", ch[0].From, "Original title")
-	}
-	if ch[0].To != "Renamed" {
-		t.Errorf("to = %q, want %q", ch[0].To, "Renamed")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a title change produced no event; the diff compared the task "+
+			"to itself: %v", err)
 	}
 }
 
-// Same guarantee as the create path: notification failures must never turn a
-// successful write into an error response.
-func TestUpdateReturns200WhenPublishFails(t *testing.T) {
-	mock := newMockDB(t)
-	expectOwnedTask(mock, existingTask())
-	expectTaskSave(mock)
-	pub := usePublisher(t, &fakePublisher{err: errors.New("broker unreachable")})
-
-	c, rec := newTestContext(t, updateBody("Renamed", "Original description",
-		"Not Started", "Low", "S", "2026-09-30"))
-	c.Params = ginParams("id", "42")
-	UpdateTask(c)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d with a failing publisher, want 200", rec.Code)
-	}
-	if len(pub.calls) != 1 {
-		t.Errorf("published %d events, want 1 (the attempt must still happen)", len(pub.calls))
-	}
-}
-
-func TestUpdateDoesNotPublishWhenSaveFails(t *testing.T) {
+// Same guarantee as the create path: an unwritable event rolls the save back,
+// so a task can never be updated without its change summary being recorded.
+func TestUpdateRollsBackWhenTheEventCannotBeRecorded(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
 	mock.ExpectBegin()
-	mock.ExpectQuery(`INSERT INTO "projects"`).
-		WillReturnRows(sqlmockRows("id", "3"))
-	mock.ExpectExec(`UPDATE "tasks"`).WillReturnError(errors.New("disk on fire"))
+	mock.ExpectQuery(`INSERT INTO "projects"`).WillReturnRows(mockIDRow(3))
+	mock.ExpectExec(`UPDATE "tasks"`).WillReturnResult(sqlmockResult())
+	expectOutboxInsertFailure(mock, errors.New("disk on fire"))
 	mock.ExpectRollback()
-	pub := usePublisher(t, &fakePublisher{})
 
 	c, rec := newTestContext(t, updateBody("Renamed", "Original description",
 		"Not Started", "Low", "S", "2026-09-30"))
@@ -154,16 +109,37 @@ func TestUpdateDoesNotPublishWhenSaveFails(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
-	if len(pub.calls) != 0 {
-		t.Errorf("published %d events after a failed save, want 0", len(pub.calls))
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the transaction did not roll back: %v", err)
 	}
 }
 
-func TestUpdateDoesNotPublishWhenTaskNotFound(t *testing.T) {
+func TestUpdateRecordsNothingWhenSaveFails(t *testing.T) {
+	mock := newMockDB(t)
+	expectOwnedTask(mock, existingTask())
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO "projects"`).
+		WillReturnRows(sqlmockRows("id", "3"))
+	mock.ExpectExec(`UPDATE "tasks"`).WillReturnError(errors.New("disk on fire"))
+	mock.ExpectRollback()
+
+	c, rec := newTestContext(t, updateBody("Renamed", "Original description",
+		"Not Started", "Low", "S", "2026-09-30"))
+	c.Params = ginParams("id", "42")
+	UpdateTask(c)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet database expectations: %v", err)
+	}
+}
+
+func TestUpdateRecordsNothingWhenTaskNotFound(t *testing.T) {
 	mock := newMockDB(t)
 	mock.ExpectQuery(`SELECT .* FROM "tasks"`).
 		WillReturnRows(mockEmptyTaskRows())
-	pub := usePublisher(t, &fakePublisher{})
 
 	c, rec := newTestContext(t, unchangedBody())
 	c.Params = ginParams("id", "999")
@@ -172,18 +148,17 @@ func TestUpdateDoesNotPublishWhenTaskNotFound(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if len(pub.calls) != 0 {
-		t.Errorf("published %d events for a task that does not exist, want 0", len(pub.calls))
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet database expectations: %v", err)
 	}
 }
 
 // --- delete ---
 
-func TestDeletePublishesDeletedEvent(t *testing.T) {
+func TestDeleteWritesTheEventInTheSameTransaction(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
-	expectTaskDelete(mock)
-	pub := usePublisher(t, &fakePublisher{})
+	expectTaskDeleteWithOutbox(mock)
 
 	c, rec := newTestContext(t, "")
 	c.Params = ginParams("id", "42")
@@ -192,50 +167,42 @@ func TestDeletePublishesDeletedEvent(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200. body: %s", rec.Code, rec.Body.String())
 	}
-	if len(pub.calls) != 1 {
-		t.Fatalf("published %d events, want 1", len(pub.calls))
-	}
-
-	call := pub.calls[0]
-	if call.eventType != events.EventTaskDeleted {
-		t.Errorf("event type = %q, want %q", call.eventType, events.EventTaskDeleted)
-	}
-	// The row is gone as far as every query is concerned, so the event has to
-	// carry the task or nothing downstream can say what was deleted.
-	if call.task.Title != "Original title" {
-		t.Errorf("delete event does not carry the task: %+v", call.task)
-	}
-	if call.actorID != testActorID {
-		t.Errorf("actor = %d, want %d", call.actorID, testActorID)
-	}
-	if len(call.changes) != 0 {
-		t.Errorf("delete carried changes %+v, want none", call.changes)
+	// The row is gone as far as every query is concerned from here on, so the
+	// event is the only remaining description of what was deleted -- which is
+	// why it has to be written before the transaction closes, not after.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the delete and its event were not written together: %v", err)
 	}
 }
 
-func TestDeleteReturns200WhenPublishFails(t *testing.T) {
+func TestDeleteRollsBackWhenTheEventCannotBeRecorded(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
-	expectTaskDelete(mock)
-	usePublisher(t, &fakePublisher{err: errors.New("broker unreachable")})
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE "tasks" SET "deleted_at"`).WillReturnResult(sqlmockResult())
+	expectOutboxInsertFailure(mock, errors.New("disk on fire"))
+	mock.ExpectRollback()
 
 	c, rec := newTestContext(t, "")
 	c.Params = ginParams("id", "42")
 	DeleteTask(c)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d with a failing publisher, want 200", rec.Code)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 -- a task must not vanish without its event",
+			rec.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the transaction did not roll back: %v", err)
 	}
 }
 
-func TestDeleteDoesNotPublishWhenDeleteFails(t *testing.T) {
+func TestDeleteRecordsNothingWhenDeleteFails(t *testing.T) {
 	mock := newMockDB(t)
 	expectOwnedTask(mock, existingTask())
 	mock.ExpectBegin()
 	mock.ExpectExec(`UPDATE "tasks" SET "deleted_at"`).
 		WillReturnError(errors.New("disk on fire"))
 	mock.ExpectRollback()
-	pub := usePublisher(t, &fakePublisher{})
 
 	c, rec := newTestContext(t, "")
 	c.Params = ginParams("id", "42")
@@ -244,15 +211,14 @@ func TestDeleteDoesNotPublishWhenDeleteFails(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
-	if len(pub.calls) != 0 {
-		t.Errorf("published %d events after a failed delete, want 0", len(pub.calls))
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet database expectations: %v", err)
 	}
 }
 
-func TestDeleteDoesNotPublishWhenTaskNotFound(t *testing.T) {
+func TestDeleteRecordsNothingWhenTaskNotFound(t *testing.T) {
 	mock := newMockDB(t)
 	mock.ExpectQuery(`SELECT .* FROM "tasks"`).WillReturnRows(mockEmptyTaskRows())
-	pub := usePublisher(t, &fakePublisher{})
 
 	c, rec := newTestContext(t, "")
 	c.Params = ginParams("id", "999")
@@ -261,7 +227,7 @@ func TestDeleteDoesNotPublishWhenTaskNotFound(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if len(pub.calls) != 0 {
-		t.Errorf("published %d events for a task that does not exist, want 0", len(pub.calls))
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet database expectations: %v", err)
 	}
 }

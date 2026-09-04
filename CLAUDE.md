@@ -152,6 +152,28 @@ Integration tests that need a real broker go behind `//go:build integration`
 and run with `go test -tags=integration ./...`, so the default `go test` stays
 fast and needs no Docker.
 
+## Outbox
+
+`task-service` does not publish from its handlers. A task change and its event are
+written in **one database transaction** — the task row and a row in `outbox` — and a
+background poller inside `task-service` publishes from that table every second and
+stamps `sent_at`. A published row is kept for 24h and then reaped.
+
+This is why creating a task works, and stays fast, with the broker stopped: the
+request path never contacts Kafka. To see pending events as data rather than as log
+lines:
+
+```bash
+docker compose exec postgres psql -U postgres -d taskmanagement \
+  -c 'select id, event_id, key, sent_at, attempts from outbox order by id;'
+```
+
+The poller publishes in `id` order and **stops the batch at the first failure**, so a
+later event for a task can never overtake an earlier one. Ordering assumes a single
+poller, which is what runs. A crash between publishing and stamping `sent_at`
+republishes the event; `notification-service` deduplicates on `event_id`, which is why
+that had to be built first.
+
 ## Known issues, deliberately unfixed
 
 **Concurrent AutoMigrate race.** All four Go services call GORM `AutoMigrate`

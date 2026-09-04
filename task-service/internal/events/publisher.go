@@ -148,27 +148,52 @@ func (p *Publisher) PublishTaskDeleted(ctx context.Context, task models.Task, ac
 	return p.publish(ctx, NewTaskDeleted(task, actorID))
 }
 
+// PublishRaw sends bytes that were serialised elsewhere, under a caller-supplied
+// partition key.
+//
+// It exists for the outbox poller, which stores the marshalled envelope at the
+// moment the task is committed and forwards it verbatim later. The poller must
+// not rebuild the envelope: doing so would re-derive occurred_at and event_id
+// long after the fact, and the whole point of the outbox is that the event was
+// decided at commit time.
+//
+// It shares the retry and message construction below with the typed methods
+// rather than duplicating them, so the auto-created-topic race and the ordering
+// key behave identically whichever way a message is published.
+func (p *Publisher) PublishRaw(ctx context.Context, key string, value []byte) error {
+	return p.send(ctx, key, value, fmt.Sprintf("outbox row keyed %s", key))
+}
+
 func (p *Publisher) publish(ctx context.Context, env Envelope) error {
 	value, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal %s event for task %d: %w", env.EventType, env.TaskID, err)
 	}
 
-	msg := kafka.Message{
+	return p.send(ctx,
 		// The partition key, and the reason events for one task stay ordered.
 		// It is the task ID and nothing else: anything per-event mixed in here
 		// (an event ID, a timestamp) would spread a single task across
 		// partitions and let its update overtake its own creation.
-		Key:   []byte(strconv.FormatUint(uint64(env.TaskID), 10)),
+		strconv.FormatUint(uint64(env.TaskID), 10),
+		value,
+		fmt.Sprintf("%s event for task %d", env.EventType, env.TaskID))
+}
+
+// send is the one path to the broker: message construction, the retry over
+// temporary errors, and the error wrapping all live here.
+func (p *Publisher) send(ctx context.Context, key string, value []byte, describe string) error {
+	msg := kafka.Message{
+		Key:   []byte(key),
 		Value: value,
 	}
 
+	var err error
 	for attempt := 0; attempt < maxPublishAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("publish %s event for task %d: %w",
-					env.EventType, env.TaskID, ctx.Err())
+				return fmt.Errorf("publish %s: %w", describe, ctx.Err())
 			case <-time.After(publishRetryDelay):
 			}
 		}
@@ -181,7 +206,7 @@ func (p *Publisher) publish(ctx context.Context, env Envelope) error {
 		}
 	}
 
-	return fmt.Errorf("publish %s event for task %d: %w", env.EventType, env.TaskID, err)
+	return fmt.Errorf("publish %s: %w", describe, err)
 }
 
 // isRetryable reports whether another attempt could plausibly succeed. kafka-go

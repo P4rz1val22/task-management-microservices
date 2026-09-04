@@ -1,62 +1,29 @@
 package handlers
 
 import (
-	"context"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"task-management-task-service/internal/database"
 	"task-management-task-service/internal/events"
 	"task-management-task-service/internal/models"
+	"task-management-task-service/internal/outbox"
 )
 
-// eventPublisher is what this package needs from internal/events. It is declared
-// here, by the consumer, rather than exported from events -- which keeps the
-// Kafka client out of the handler tests entirely and lets a test install a fake
-// that records calls.
-type eventPublisher interface {
-	PublishTaskCreated(ctx context.Context, task models.Task, actorID uint) error
-	PublishTaskUpdated(ctx context.Context, task models.Task, actorID uint, changes []events.ChangeDetail) error
-	PublishTaskDeleted(ctx context.Context, task models.Task, actorID uint) error
-}
-
-// publishTimeout bounds how long a write may wait on the broker before giving up
-// and answering the caller anyway.
+// OutboxTopic is the topic events are recorded against. Read once at startup
+// from KAFKA_TOPIC, mirroring how database.DB is installed.
 //
-// Two seconds is a deliberate trade. Publishing synchronously means a 201 really
-// does imply the event reached Kafka, which is what makes the notification
-// pipeline trustworthy on the happy path. The cost is that when the broker is
-// down, every create pays this much latency before returning its (still
-// successful) 201. Shorter would give up on a broker that is merely mid-restart;
-// longer would make an outage feel like a hang.
-const publishTimeout = 2 * time.Second
-
-// Publisher is assigned by main.go at startup, mirroring how database.DB works
-// in this service. The no-op default means an unwired binary logs instead of
-// panicking on a nil interface.
-var Publisher eventPublisher = noopPublisher{}
-
-// noopPublisher is the default: it drops events and says so, which is the right
-// behaviour for a binary that was never given a real publisher.
-type noopPublisher struct{}
-
-func (noopPublisher) PublishTaskCreated(_ context.Context, task models.Task, _ uint) error {
-	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.created for task %d", task.ID)
-	return nil
-}
-
-func (noopPublisher) PublishTaskUpdated(_ context.Context, task models.Task, _ uint, _ []events.ChangeDetail) error {
-	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.updated for task %d", task.ID)
-	return nil
-}
-
-func (noopPublisher) PublishTaskDeleted(_ context.Context, task models.Task, _ uint) error {
-	log.Printf("[TASK-SERVICE] no publisher configured; dropping task.deleted for task %d", task.ID)
-	return nil
-}
+// Note what is NOT here any more. There is no publisher, no publish timeout and
+// no "log the failure and return 201 anyway": handlers do not talk to Kafka at
+// all. They record the event in the same database transaction as the change
+// that caused it, and the outbox poller publishes it afterwards. A broker
+// outage is now invisible to the request path rather than something it has to
+// survive.
+var OutboxTopic = "task-events"
 
 type TaskRequest struct {
 	Title       string `json:"title" binding:"required"`
@@ -154,27 +121,24 @@ func CreateTask(c *gin.Context) {
 		DueDate:     dueDate,
 	}
 
-	if err := database.DB.Create(&task).Error; err != nil {
+	// The task and its event are one atomic fact. Committing the task and then
+	// publishing was two things that were not one thing: a crash or an
+	// unreachable broker in between left the task existing and the event never
+	// happening, with nothing anywhere that could replay it.
+	//
+	// If the outbox insert fails, the task insert rolls back with it. That is
+	// the point, and it costs nothing in practice: both are local writes to the
+	// same database, so the only way the second fails is a database problem
+	// that would have failed the first.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		return outbox.Write(tx, events.NewTaskCreated(task, userID), OutboxTopic)
+	}); err != nil {
+		log.Printf("[TASK-SERVICE] create task: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
 		return
-	}
-
-	// Publish task.created. This replaces the notification placeholder left behind when
-	// the task code was extracted from the monolith, and it is deliberately the
-	// last thing that happens before the response.
-	//
-	// The context is derived from Background, not from the request: the task is
-	// committed, so a client that has hung up must not cancel an event for a task
-	// that genuinely exists.
-	publishCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
-	defer cancel()
-	if err := Publisher.PublishTaskCreated(publishCtx, task, userID); err != nil {
-		// Logged, never fatal. The task is committed and the caller gets its 201;
-		// a lost notification is by far the lesser failure, and taking the write
-		// path down for a mail side effect is exactly what this migration exists
-		// to stop. The event is genuinely lost here -- a transactional outbox is
-		// what would make it recoverable rather than merely survivable.
-		log.Printf("[TASK-SERVICE] publish task.created for task %d: %v", task.ID, err)
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
@@ -402,24 +366,23 @@ func UpdateTask(c *gin.Context) {
 	task.Estimate = req.Estimate
 	task.DueDate = dueDate
 
-	if err := database.DB.Save(&task).Error; err != nil {
+	// Saved and recorded together. The event is written only if something
+	// actually changed: hitting save without editing anything is something
+	// users do constantly and must not notify anyone, which DiffTask returning
+	// an empty slice is what encodes.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&task).Error; err != nil {
+			return err
+		}
+		changes := events.DiffTask(before, task)
+		if len(changes) == 0 {
+			return nil
+		}
+		return outbox.Write(tx, events.NewTaskUpdated(task, userID, changes), OutboxTopic)
+	}); err != nil {
+		log.Printf("[TASK-SERVICE] update task %d: %v", task.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update task"})
 		return
-	}
-
-	// Publish task.updated, but only if something actually changed. Hitting
-	// save without editing anything is something users do constantly, and it
-	// must not produce an event or an email -- events.DiffTask returning an
-	// empty slice is what encodes that, and
-	// TestUpdateWithNoChangesPublishesNothing is what holds it in place.
-	if changes := events.DiffTask(before, task); len(changes) > 0 {
-		publishCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancel()
-		if err := Publisher.PublishTaskUpdated(publishCtx, task, userID, changes); err != nil {
-			// Logged, never fatal -- same reasoning as the create path. The
-			// task is saved and the caller gets its 200.
-			log.Printf("[TASK-SERVICE] publish task.updated for task %d: %v", task.ID, err)
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -454,19 +417,19 @@ func DeleteTask(c *gin.Context) {
 		return
 	}
 
-	if err := database.DB.Delete(&task).Error; err != nil {
+	// Deleted and recorded together. The envelope carries the whole task, which
+	// matters more here than on any other path: the row is filtered out of
+	// every query from this point on, so the event is the only remaining
+	// description of what was deleted.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&task).Error; err != nil {
+			return err
+		}
+		return outbox.Write(tx, events.NewTaskDeleted(task, userID), OutboxTopic)
+	}); err != nil {
+		log.Printf("[TASK-SERVICE] delete task %d: %v", task.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete task"})
 		return
-	}
-
-	// Publish task.deleted. The envelope carries the whole task, which matters
-	// more here than on any other path: the row is filtered out of every query
-	// from this point on, so the event is the only remaining description of
-	// what was deleted.
-	publishCtx, cancel := context.WithTimeout(context.Background(), publishTimeout)
-	defer cancel()
-	if err := Publisher.PublishTaskDeleted(publishCtx, task, userID); err != nil {
-		log.Printf("[TASK-SERVICE] publish task.deleted for task %d: %v", task.ID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

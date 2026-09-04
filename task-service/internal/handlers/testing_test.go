@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"context"
+	"database/sql/driver"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -13,7 +13,6 @@ import (
 	"gorm.io/gorm"
 
 	"task-management-task-service/internal/database"
-	"task-management-task-service/internal/events"
 	"task-management-task-service/internal/models"
 )
 
@@ -110,71 +109,6 @@ func newTestContext(t *testing.T, body string) (*gin.Context, *httptest.Response
 	return c, rec
 }
 
-// publishCall is one recorded invocation of the publisher.
-//
-// It records the state of the context as well as the arguments, because two of
-// this stage's guarantees are about the context rather than the payload: that a
-// client hanging up does not cancel a legitimate event, and that a wedged broker
-// cannot pin the handler open forever.
-type publishCall struct {
-	eventType string
-	task      models.Task
-	actorID   uint
-	changes   []events.ChangeDetail
-
-	// Captured at call time, not read from a retained context afterwards. The
-	// handler wraps its publish in a defer cancel(), so by the time a test
-	// inspects a stored context it is always cancelled and always has an
-	// expired deadline -- inspecting it later measures nothing.
-	ctxErr      error
-	deadline    time.Time
-	hasDeadline bool
-}
-
-// fakePublisher stands in for *events.Publisher. Because the handler declares
-// its own eventPublisher interface, this fake keeps kafka-go out of the handler
-// tests entirely.
-type fakePublisher struct {
-	calls []publishCall
-	err   error
-}
-
-func (f *fakePublisher) record(ctx context.Context, eventType string, task models.Task, actorID uint, changes []events.ChangeDetail) error {
-	deadline, hasDeadline := ctx.Deadline()
-	f.calls = append(f.calls, publishCall{
-		eventType:   eventType,
-		task:        task,
-		actorID:     actorID,
-		changes:     changes,
-		ctxErr:      ctx.Err(),
-		deadline:    deadline,
-		hasDeadline: hasDeadline,
-	})
-	return f.err
-}
-
-func (f *fakePublisher) PublishTaskCreated(ctx context.Context, task models.Task, actorID uint) error {
-	return f.record(ctx, events.EventTaskCreated, task, actorID, nil)
-}
-
-func (f *fakePublisher) PublishTaskUpdated(ctx context.Context, task models.Task, actorID uint, changes []events.ChangeDetail) error {
-	return f.record(ctx, events.EventTaskUpdated, task, actorID, changes)
-}
-
-func (f *fakePublisher) PublishTaskDeleted(ctx context.Context, task models.Task, actorID uint) error {
-	return f.record(ctx, events.EventTaskDeleted, task, actorID, nil)
-}
-
-// usePublisher installs a fake for the duration of one test and restores the
-// package default afterwards.
-func usePublisher(t *testing.T, f *fakePublisher) *fakePublisher {
-	t.Helper()
-	previous := Publisher
-	Publisher = f
-	t.Cleanup(func() { Publisher = previous })
-	return f
-}
-
 // The harness's own smoke test: gorm.Open must not talk to the database.
 func TestMockDBOpensCleanly(t *testing.T) {
 	mock := newMockDB(t)
@@ -263,4 +197,46 @@ func mockEmptyTaskRows() *sqlmock.Rows {
 // sqlmockRows is a one-row shorthand for the small fixtures above.
 func sqlmockRows(column, value string) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{column}).AddRow(value)
+}
+
+// expectOutboxInsert queues the event row that must be written in the same
+// transaction as the change that caused it. Its position between the write and
+// the COMMIT is the assertion: sqlmock matches expectations in order, so a
+// handler that wrote outside the transaction, or not at all, fails here.
+func expectOutboxInsert(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(`INSERT INTO "outbox"`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+}
+
+// expectOutboxInsertFailure queues an event row that cannot be written, so the
+// surrounding transaction must roll back and take the task change with it.
+func expectOutboxInsertFailure(mock sqlmock.Sqlmock, err error) {
+	mock.ExpectQuery(`INSERT INTO "outbox"`).WillReturnError(err)
+}
+
+// mockIDRow is the RETURNING "id" result GORM reads after an insert.
+func mockIDRow(id uint) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id"}).AddRow(id)
+}
+
+func sqlmockResult() driver.Result {
+	return sqlmock.NewResult(0, 1)
+}
+
+// expectTaskSaveWithOutbox is expectTaskSave plus the event row that must land
+// inside the same transaction.
+func expectTaskSaveWithOutbox(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO "projects"`).WillReturnRows(mockIDRow(3))
+	mock.ExpectExec(`UPDATE "tasks"`).WillReturnResult(sqlmockResult())
+	expectOutboxInsert(mock)
+	mock.ExpectCommit()
+}
+
+// expectTaskDeleteWithOutbox is expectTaskDelete plus the event row.
+func expectTaskDeleteWithOutbox(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE "tasks" SET "deleted_at"`).WillReturnResult(sqlmockResult())
+	expectOutboxInsert(mock)
+	mock.ExpectCommit()
 }

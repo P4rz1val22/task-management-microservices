@@ -448,3 +448,51 @@ func TestUpdateAndDeleteErrorsPropagate(t *testing.T) {
 		t.Errorf("delete error = %v, want it to wrap %v", err, boom)
 	}
 }
+
+// --- Stage 8b: raw publishing for the outbox poller ---
+
+// The poller forwards stored bytes; it does not rebuild an envelope. PublishRaw
+// is the seam for that, and it must produce a message indistinguishable from
+// one built here -- same key semantics, same value bytes.
+func TestPublishRawSendsKeyAndValueUnchanged(t *testing.T) {
+	f := &fakeWriter{}
+	p := newTestPublisher(f)
+
+	payload := []byte(`{"event_id":"evt-1","event_type":"task.created","task_id":42}`)
+	if err := p.PublishRaw(context.Background(), "42", payload); err != nil {
+		t.Fatalf("PublishRaw: %v", err)
+	}
+
+	if len(f.sent) != 1 {
+		t.Fatalf("wrote %d messages, want 1", len(f.sent))
+	}
+	if got := string(f.sent[0].Key); got != "42" {
+		t.Errorf("key = %q, want %q", got, "42")
+	}
+	if got := string(f.sent[0].Value); got != string(payload) {
+		t.Errorf("value = %q, want the stored bytes verbatim", got)
+	}
+}
+
+// A raw publish is subject to the same retry as a built one -- the auto-created
+// topic race does not care which method the caller used.
+func TestPublishRawRetriesUnknownTopic(t *testing.T) {
+	f := &fakeWriter{errSeq: []error{kafka.UnknownTopicOrPartition}}
+	p := newTestPublisher(f)
+
+	if err := p.PublishRaw(context.Background(), "42", []byte(`{}`)); err != nil {
+		t.Fatalf("PublishRaw: %v", err)
+	}
+	if f.calls != 2 {
+		t.Errorf("writer called %d times, want 2 (one failure, one retry)", f.calls)
+	}
+}
+
+func TestPublishRawErrorsPropagate(t *testing.T) {
+	boom := errors.New("broker unreachable")
+	p := newTestPublisher(&fakeWriter{err: boom})
+
+	if err := p.PublishRaw(context.Background(), "42", []byte(`{}`)); !errors.Is(err, boom) {
+		t.Errorf("error = %v, want it to wrap %v", err, boom)
+	}
+}

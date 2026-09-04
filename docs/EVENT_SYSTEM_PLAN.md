@@ -70,8 +70,10 @@ is:
    contract, the partition key, the change-diffing rules, and the "publish failure still
    returns 201" guarantee — complementing the existing 17-request Postman suite rather than
    replacing it.
-5. **A gap we can articulate rather than hide.** Events are published after the DB commit, so
-   a crash between the two loses an event. The fix is a transactional outbox (Stage 8, item 3).
+5. **A gap we can articulate rather than hide — and then closed.** Events were published after
+   the DB commit, so a crash between the two lost an event. **Stage 8b fixed it**: the event is
+   now written to an `outbox` table inside the same transaction as the task, and a poller
+   publishes from there.
    Whether or not it gets built, being able to name it is part of the deliverable.
 
 ---
@@ -982,9 +984,7 @@ it prevents is hard to trigger by hand. In rough order of value per hour:
 
 - [x] Idempotent consumption
 - [x] Retry with a dead-letter topic
-- [ ] Transactional outbox — deferred to **Stage 8b**, with its own plan, because it changes
-      the write path and adds a background process (the same profile that made Stage 4 use
-      plan mode)
+- [x] Transactional outbox — built as **Stage 8b**, below
 
 **Sequencing was a dependency, not just cost order.** Item 1 had to come first because item 3
 needs it: an outbox poller publishes a row and then marks it sent, so a crash between those
@@ -1120,3 +1120,74 @@ the docs — which is the point of the restructure.
 3. The line worth landing, once it is true: *replaced in-process goroutine notifications
    with a durable Kafka consumer group, so task writes no longer depend on mail delivery.*
    That is a design decision with a reason, which reads better than a tool list.
+
+
+---
+
+### Stage 8b — Transactional outbox
+
+The last real hole, closed. `task-service` used to commit the task and then publish,
+which is two things that were not one thing: a crash or an unreachable broker in
+between left the task existing and the event never happening, with nothing anywhere
+that could replay it. Retrying could never fix that, because the failure can be the
+process disappearing, and no code runs after a crash.
+
+Now the event is written into an `outbox` table **inside the same transaction as the
+task**. The two rows commit together or neither exists. A poller publishes from that
+table on a one-second tick and marks rows sent.
+
+- [x] Outbox tests written first and observed failing
+- [x] Create/update/delete each write task + outbox in one transaction
+- [x] Outbox-insert failure rolls back the task (the headline assertion)
+- [x] No-op update still writes nothing
+- [x] Poller publishes in `id` order and stops the batch on first failure
+- [x] `publishTimeout`, `handlers.Publisher` and `noopPublisher` deleted
+- [x] Tasks created with Kafka stopped are published automatically once it returns
+- [x] Commit: `feat: transactional outbox for task events`
+
+**The guarantee moved rather than disappeared.** Stage 4's headline test was "a publish
+failure still returns 201". There is no publish left to fail: the outbox write is a
+local insert in the same transaction, so it fails only when the database fails, in
+which case the task creation was going to fail anyway. That test became
+`TestCreateTaskRollsBackWhenTheEventCannotBeRecorded` — the same guarantee, asserted
+where it now lives. sqlmock matches expectations in order, so the create tests are a
+real claim about the shape of the transaction: BEGIN, task, event, COMMIT.
+
+**The request path no longer knows Kafka exists.** `publishTimeout`,
+`handlers.Publisher`, the `eventPublisher` interface and `noopPublisher` are all
+deleted. A create used to wait up to 2s when the broker was down; now it never
+contacts the broker at all, so that ceiling is gone along with the code that needed it.
+
+**Two properties in the poller carry the design:**
+
+1. **Rows publish in `id` order**, which is insertion order, which is the order the
+   events happened. With the partition key, that is what keeps a `task.updated` from
+   overtaking its own `task.created`.
+2. **A failure stops the batch.** Skipping a failed row and continuing would publish
+   a later event for a task before an earlier one — the exact reordering the
+   single-topic design exists to prevent, happening precisely when the broker is
+   flaky and nobody is watching closely.
+
+There is deliberately **no transaction around a batch**. Holding one open across a
+network round trip per row would keep locks for the length of a Kafka outage. A second
+poller could therefore publish a row twice, which the consumer already deduplicates —
+the same duplicate this design accepts by construction. Ordering, however, assumes a
+single poller, which is what runs.
+
+**What it still does not buy, stated plainly.** Not exactly-once: the poller publishes
+a row and then marks it sent, so a crash between those republishes the event. That is
+by design, and it is why Stage 8's deduplication had to land first — an outbox
+*creates* duplicates and is only safe on top of an idempotent consumer. It also adds
+up to one poll interval of notification latency, which for email is invisible.
+
+**Observed end to end — the scenario that had failed since Stage 4:**
+
+| Step | Result |
+|---|---|
+| `docker compose stop kafka`, create two tasks | Both 201, and fast — the request never touches the broker |
+| Inspect the database | Two `outbox` rows, `sent_at` NULL: the events exist **as data**, not as a lost log line |
+| Poller meanwhile | Retries every second, logging the real dial error rather than pretending |
+| `docker compose start kafka` | Within a tick: `outbox published 2 events`, both rows `sent_at` set, `attempts = 1` |
+| notification-service | Emailed both — the two notifications that were previously lost forever |
+
+Consumer lag returned to zero on all three partitions with no intervention.
