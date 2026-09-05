@@ -1,12 +1,29 @@
 package handlers
 
 import (
-	"github.com/gin-gonic/gin"
+	"log"
 	"net/http"
-	"task-management-task-service/internal/database"
-	"task-management-task-service/internal/models"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"task-management-task-service/internal/database"
+	"task-management-task-service/internal/events"
+	"task-management-task-service/internal/models"
+	"task-management-task-service/internal/outbox"
 )
+
+// OutboxTopic is the topic events are recorded against. Read once at startup
+// from KAFKA_TOPIC, mirroring how database.DB is installed.
+//
+// Note what is NOT here any more. There is no publisher, no publish timeout and
+// no "log the failure and return 201 anyway": handlers do not talk to Kafka at
+// all. They record the event in the same database transaction as the change
+// that caused it, and the outbox poller publishes it afterwards. A broker
+// outage is now invisible to the request path rather than something it has to
+// survive.
+var OutboxTopic = "task-events"
 
 type TaskRequest struct {
 	Title       string `json:"title" binding:"required"`
@@ -104,13 +121,25 @@ func CreateTask(c *gin.Context) {
 		DueDate:     dueDate,
 	}
 
-	if err := database.DB.Create(&task).Error; err != nil {
+	// The task and its event are one atomic fact. Committing the task and then
+	// publishing was two things that were not one thing: a crash or an
+	// unreachable broker in between left the task existing and the event never
+	// happening, with nothing anywhere that could replay it.
+	//
+	// If the outbox insert fails, the task insert rolls back with it. That is
+	// the point, and it costs nothing in practice: both are local writes to the
+	// same database, so the only way the second fails is a database problem
+	// that would have failed the first.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		return outbox.Write(tx, events.NewTaskCreated(task, userID), OutboxTopic)
+	}); err != nil {
+		log.Printf("[TASK-SERVICE] create task: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
 		return
 	}
-
-	// TODO: Send notification to Notification Service (future microservice)
-	// For now, we skip the email notification
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Task created successfully",
@@ -198,7 +227,7 @@ func GetTasks(c *gin.Context) {
 	}
 
 	// Build enriched response with cross-service data
-	var taskList []gin.H
+	taskList := make([]gin.H, 0, len(tasks))
 	for _, task := range tasks {
 		taskList = append(taskList, gin.H{
 			"id":          task.ID,
@@ -319,11 +348,14 @@ func UpdateTask(c *gin.Context) {
 		dueDate = &parsed
 	}
 
-	// Track changes for notification (future use)
-	//originalTitle := task.Title
-	//originalStatus := task.Status
-	//originalPriority := task.Priority
-	//originalEstimate := task.Estimate
+	// Snapshot the task before the request is applied. The diff has to be taken
+	// against these values -- comparing after the assignments below would
+	// compare the task to itself and every update would look like a no-op.
+	//
+	// A struct copy is enough. DueDate is a pointer, but the assignment below
+	// replaces it with a different pointer rather than writing through the old
+	// one, so the snapshot keeps pointing at the original date.
+	before := task
 
 	// Update task
 	task.Title = req.Title
@@ -334,13 +366,24 @@ func UpdateTask(c *gin.Context) {
 	task.Estimate = req.Estimate
 	task.DueDate = dueDate
 
-	if err := database.DB.Save(&task).Error; err != nil {
+	// Saved and recorded together. The event is written only if something
+	// actually changed: hitting save without editing anything is something
+	// users do constantly and must not notify anyone, which DiffTask returning
+	// an empty slice is what encodes.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&task).Error; err != nil {
+			return err
+		}
+		changes := events.DiffTask(before, task)
+		if len(changes) == 0 {
+			return nil
+		}
+		return outbox.Write(tx, events.NewTaskUpdated(task, userID, changes), OutboxTopic)
+	}); err != nil {
+		log.Printf("[TASK-SERVICE] update task %d: %v", task.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update task"})
 		return
 	}
-
-	// TODO: Send change notification to Notification Service
-	// Track what changed: originalTitle vs task.Title, etc.
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Task updated successfully",
@@ -374,7 +417,17 @@ func DeleteTask(c *gin.Context) {
 		return
 	}
 
-	if err := database.DB.Delete(&task).Error; err != nil {
+	// Deleted and recorded together. The envelope carries the whole task, which
+	// matters more here than on any other path: the row is filtered out of
+	// every query from this point on, so the event is the only remaining
+	// description of what was deleted.
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&task).Error; err != nil {
+			return err
+		}
+		return outbox.Write(tx, events.NewTaskDeleted(task, userID), OutboxTopic)
+	}); err != nil {
+		log.Printf("[TASK-SERVICE] delete task %d: %v", task.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete task"})
 		return
 	}

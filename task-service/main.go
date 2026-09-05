@@ -1,18 +1,50 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"task-management-task-service/internal/database"
-	"task-management-task-service/internal/handlers"
-	"task-management-task-service/internal/middleware"
+	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"task-management-task-service/internal/database"
+	"task-management-task-service/internal/events"
+	"task-management-task-service/internal/handlers"
+	"task-management-task-service/internal/middleware"
+	"task-management-task-service/internal/outbox"
 )
+
+func valueOr(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
+}
 
 func main() {
 	// Connect to database
 	database.Connect()
+
+	// The outbox table is task-service's own -- nothing else reads or writes it
+	// -- so migrating it here is not the four-way race the shared tables have.
+	if err := outbox.Migrate(database.DB); err != nil {
+		log.Fatal("Failed to migrate outbox:", err)
+	}
+
+	// Handlers no longer publish. They record events into the outbox inside the
+	// same transaction as the change, and this poller drains that table in the
+	// background. The request path never touches Kafka, so a broker outage
+	// cannot slow a write down, let alone lose its event.
+	handlers.OutboxTopic = valueOr(os.Getenv("KAFKA_TOPIC"), events.DefaultTopic)
+
+	publisher := events.NewPublisher()
+	defer publisher.Close()
+
+	pollerCtx, stopPoller := context.WithCancel(context.Background())
+	defer stopPoller()
+	go outbox.NewPoller(database.DB, publisher).Run(pollerCtx)
 
 	// Set Gin mode
 	gin.SetMode(gin.ReleaseMode)

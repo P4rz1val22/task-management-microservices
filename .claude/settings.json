@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go vet *)",
+      "Bash(go build *)",
+      "Bash(gofmt *)",
+      "Bash(docker compose ps)",
+      "Bash(docker compose ps *)",
+      "Bash(docker compose logs *)",
+      "Bash(docker compose config)",
+      "Bash(docker compose config *)",
+      "Bash(docker info)",
+      "Bash(curl -s localhost:*)"
+    ]
+  }
+}

@@ -92,7 +92,7 @@ func GetProjects(c *gin.Context) {
 		return
 	}
 
-	var projectList []gin.H
+	projectList := make([]gin.H, 0, len(projects))
 	for _, project := range projects {
 		projectList = append(projectList, gin.H{
 			"id":          project.ID,
